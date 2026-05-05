@@ -489,7 +489,7 @@ async function preprocessImage(base64, mimeType) {
       // characters that Tesseract couldn't recognize. 155 preserves more of the ink.
       .threshold(155)
       .resize({
-        width:              20,            // âœ¨ UPGRADED: 24â†’20 for small text
+        width:              2000,          // FIX: was accidentally 20px — too small for Tesseract
         fit:                'inside',
         withoutEnlargement: false,
       })
@@ -627,7 +627,7 @@ async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'bu
     try {
       console.log('[AutoChecker] Trying lighter threshold (140) for faint handwritingâ€¦');
       const lightBuffer = await sharp(Buffer.from(imageBase64, 'base64'))
-        .rotate().greyscale().normalise().sharpen({ sigma: 1.5 }).threshold(140).resize({ width: 20, fit: 'inside', withoutEnlargement: false }).png().toBuffer();
+        .rotate().greyscale().normalise().sharpen({ sigma: 1.5 }).threshold(140).resize({ width: 2000, fit: 'inside', withoutEnlargement: false }).png().toBuffer();
       const { text, confidence } = await tryOcrWithPsm(lightBuffer, 6, extraParams);
       const score = isMcType ? scoreMcText(text) : scoreTextBlock(text);
       console.log(`[Tesseract light-threshold] score=${score}, conf=${confidence?.toFixed(1)}%`);
