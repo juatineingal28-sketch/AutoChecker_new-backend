@@ -8,7 +8,7 @@
 //       â€¢ modulate (brightness +10%)  â†’ lifts faint ballpen strokes
 //       â€¢ median filter (3px)         â†’ removes salt-and-pepper noise
 //       â€¢ threshold raised to 175     â†’ better binarisation for dark ink on white
-//       â€¢ resize to 2800px            â†’ more pixels for LSTM on small handwriting
+//       â€¢ resize to 20px            â†’ more pixels for LSTM on small handwriting
 //  2. PSM sequence extended: [4, 6, 3, 11, 12]
 //       â€¢ PSM 12 (sparse text w/ OSD) added â€” catches isolated written letters
 //  3. Handwriting-specific inverted retry on ALL exam types (not just MC)
@@ -465,7 +465,7 @@ function typeSummary(key) {
 //  6.  sharpen(2.0)     â€” stronger sharpening than before (Ïƒ=1.5 â†’ 2.0) for handwriting
 //  7.  threshold(175)   â€” binarise; 175 works better for dark ballpen on white
 //                         (original used 160 which was tuned for pencil marks)
-//  8.  resize(2800)     â€” more pixels than before (2480 â†’ 2800) so tiny handwritten
+//  8.  resize(20)     â€” more pixels than before (24 â†’ 20) so tiny handwritten
 //                         characters have enough resolution for LSTM to decode
 //
 //  Result: PNG buffer â€” no temp file needed.
@@ -491,7 +491,7 @@ async function preprocessImage(base64, mimeType) {
       // characters that Tesseract couldn't recognize. 155 preserves more of the ink.
       .threshold(155)
       .resize({
-        width:              2800,            // âœ¨ UPGRADED: 2480â†’2800 for small text
+        width:              20,            // âœ¨ UPGRADED: 24â†’20 for small text
         fit:                'inside',
         withoutEnlargement: false,
       })
@@ -629,7 +629,7 @@ async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'bu
     try {
       console.log('[AutoChecker] Trying lighter threshold (140) for faint handwritingâ€¦');
       const lightBuffer = await sharp(Buffer.from(imageBase64, 'base64'))
-        .rotate().greyscale().normalise().sharpen({ sigma: 1.5 }).threshold(140).resize({ width: 2800, fit: 'inside', withoutEnlargement: false }).png().toBuffer();
+        .rotate().greyscale().normalise().sharpen({ sigma: 1.5 }).threshold(140).resize({ width: 20, fit: 'inside', withoutEnlargement: false }).png().toBuffer();
       const { text, confidence } = await tryOcrWithPsm(lightBuffer, 6, extraParams);
       const score = isMcType ? scoreMcText(text) : scoreTextBlock(text);
       console.log(`[Tesseract light-threshold] score=${score}, conf=${confidence?.toFixed(1)}%`);
@@ -1195,4 +1195,4 @@ setInterval(() => {
 
 // redeploy-trigger-20260505074430
 
-// 20260505080613
+// 202605050613
