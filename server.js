@@ -553,7 +553,8 @@ async function tryOcrWithPsm(imageBuffer, psmMode, extraParams = {}) {
 // â”€â”€â”€ Multi-PSM Tesseract runner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'bubble_mc') {
-  const isMcType    = examType === 'bubble_mc' || examType === 'text_mc' || examType === 'bubble_omr' || examType === 'multiple_choice';
+  // ✅ After
+const isMcType = examType === 'bubble_mc' || examType === 'text_mc' || examType === 'bubble_omr' || examType === 'multiple_choice' || examType === 'omr';
   const psmList     = isMcType ? PSM_SEQUENCE_MC : PSM_SEQUENCE_TEXT;
   const whitelist   = isMcType ? CHAR_WHITELIST_MC : CHAR_WHITELIST_TEXT;
   const imageBuffer = await preprocessImage(imageBase64, mimeType);
@@ -917,8 +918,9 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
 
 
 async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
-  const isBubble = examType === 'bubble_mc' || examType === 'bubble_omr';
-  const isMcType = isBubble || examType === 'text_mc' || examType === 'multiple_choice';
+  // ✅ After — recognizes the new 'omr' string too
+const isBubble = examType === 'bubble_mc' || examType === 'bubble_omr' || examType === 'omr';
+const isMcType = isBubble || examType === 'text_mc' || examType === 'multiple_choice';
 
   // ── Route bubble_omr to Jimp pixel detector first ───────────────────────
   if (isBubble) {
