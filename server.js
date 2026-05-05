@@ -46,8 +46,6 @@ const _pdfParseLib = require('pdf-parse');
 const pdfParse = typeof _pdfParseLib === 'function' ? _pdfParseLib : _pdfParseLib.default;
 const mammoth   = require('mammoth');
 const Tesseract = require('tesseract.js');
-const Anthropic = require('@anthropic-ai/sdk');
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // sharp is optional â€” gracefully degrade if not installed
 let sharp;
