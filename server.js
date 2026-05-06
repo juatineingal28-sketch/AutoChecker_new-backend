@@ -1079,6 +1079,53 @@ app.delete('/api/answer-key/:sectionId', (req, res) => {
   res.json({ success: true });
 });
 
+// ─── Extract Text from DOCX / TXT / PDF ──────────────────────────────────────
+//
+// POST /api/extract-text
+// Accepts a .docx, .txt, or .pdf file upload and returns the plain text.
+// Used by UploadScreen to extract answer key text before parsing.
+//
+// Response: { success: true, text: "..." }
+//        or { success: false, error: "..." }
+
+app.post('/api/extract-text', upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: 'No file uploaded.' });
+  }
+
+  const filePath = req.file.path;
+  const ext      = path.extname(req.file.originalname).toLowerCase();
+
+  try {
+    let text = '';
+
+    if (ext === '.docx' || ext === '.doc') {
+      const result = await mammoth.extractRawText({ path: filePath });
+      text = result.value ?? '';
+    } else if (ext === '.txt') {
+      text = fs.readFileSync(filePath, 'utf8');
+    } else if (ext === '.pdf') {
+      const dataBuffer = fs.readFileSync(filePath);
+      const parsed     = await pdfParse(dataBuffer);
+      text = parsed.text ?? '';
+    } else {
+      return res.status(400).json({ success: false, error: `Unsupported file type: ${ext}` });
+    }
+
+    if (!text.trim()) {
+      return res.status(422).json({ success: false, error: 'File appears to be empty or has no readable text.' });
+    }
+
+    res.json({ success: true, text });
+  } catch (err) {
+    console.error('[AutoChecker] extract-text error:', err.message);
+    res.status(500).json({ success: false, error: `Could not extract text: ${err.message}` });
+  } finally {
+    // Clean up uploaded file
+    try { fs.unlinkSync(filePath); } catch {}
+  }
+});
+
 // Score
 app.post('/api/score/:sectionId', (req, res) => {
   const record = readStore(req.params.sectionId);
