@@ -415,19 +415,108 @@ async function parseUploadedFile(filePath, ext) {
       // Remove excess blank lines
       .replace(/\n{3,}/g, '\n\n');
 
-    const items = parseTextLines(text);
+    // ── Section-aware parsing (handles mixed answer key types) ────────────────
+    // Detect section headers like "MULTIPLE CHOICE ANSWERKEY", "IDENTIFICATION", etc.
+    const SECTION_PATTERNS = [
+      { type: 'mc',            re: /multiple\s*choice|bubble\s*omr|omr/i },
+      { type: 'identification',re: /identification|identify/i },
+      { type: 'enumeration',   re: /enumeration|enumerate/i },
+      { type: 'truefalse',     re: /true\s*(or|\/)\s*false|t\s*[\/or]+\s*f\b/i },
+    ];
 
-    console.log(`[AutoChecker] DOCX extracted ${text.split('\n').length} lines`);
+    function detectSectionType(line) {
+      // Strip trailing "ANSWERKEY(S)" and punctuation
+      const cleaned = line.trim().replace(/[:.]+$/, '').replace(/\s*answer\s*keys?$/i, '').trim();
+      if (/^\d+[.):\s]/.test(cleaned) || cleaned.length > 60) return null;
+      for (const def of SECTION_PATTERNS) {
+        if (def.re.test(cleaned)) return def.type;
+      }
+      return null;
+    }
+
+    function stripBullet(line) {
+      return line.replace(/^[\t ]*[-–—*•]\s+/, '').trim();
+    }
+
+    // Check if this docx has section headers
+    const rawLines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const hasSections = rawLines.some(l => detectSectionType(l) !== null);
+
+    let items;
+
+    if (hasSections) {
+      // Section-aware parsing: group lines by section, auto-number within each section
+      items = [];
+      let currentType = null;
+      let globalQ = 1;
+      let sectionLines = [];
+
+      const flushSection = () => {
+        if (!currentType || sectionLines.length === 0) return;
+        let autoNum = 1;
+        for (const sLine of sectionLines) {
+          const stripped = stripBullet(sLine);
+          if (!stripped) continue;
+
+          // Check if line has its own number (e.g. "1. CSS" or "1) True")
+          const numMatch = stripped.match(/^(\d+)\s*[.):\s]\s*(.+)/);
+          let rawAnswer, lineNum;
+          if (numMatch) {
+            lineNum  = parseInt(numMatch[1], 10);
+            rawAnswer = numMatch[2].trim();
+          } else {
+            lineNum  = autoNum;
+            rawAnswer = stripped;
+          }
+
+          if (!rawAnswer) continue;
+
+          // Enumeration: comma-separated on one line → expand into multiple items
+          if (currentType === 'enumeration' && rawAnswer.includes(',') && !rawAnswer.includes(';')) {
+            const parts = rawAnswer.split(',').map(s => s.trim()).filter(Boolean);
+            if (parts.length > 1) {
+              for (const part of parts) {
+                items.push({ question: globalQ++, type: 'enumeration', answer: normalizeAnswer('enumeration', part) });
+              }
+              autoNum++;
+              continue;
+            }
+          }
+
+          items.push({ question: globalQ++, type: currentType, answer: normalizeAnswer(currentType, rawAnswer) });
+          autoNum = lineNum + 1;
+        }
+        sectionLines = [];
+      };
+
+      for (const line of rawLines) {
+        const sType = detectSectionType(line);
+        if (sType !== null) {
+          flushSection();
+          currentType = sType;
+        } else if (currentType !== null) {
+          sectionLines.push(line);
+        }
+      }
+      flushSection();
+
+      console.log(`[AutoChecker] DOCX section-aware parse → ${items.length} answers across multiple section types`);
+    } else {
+      // Fallback: legacy numbered-line parser
+      items = parseTextLines(text);
+      console.log(`[AutoChecker] DOCX extracted ${text.split('\n').length} lines → ${items.length} answers (legacy parser)`);
+    }
+
     if (items.length === 0) {
-      console.warn('[AutoChecker] âš ï¸  DOCX: no answer key detected. Raw text sample:\n' + text.slice(0, 500));
+      console.warn('[AutoChecker] ⚠️  DOCX: no answer key detected. Raw text sample:\n' + text.slice(0, 500));
     }
 
     if (items.length) {
-      console.log(`[AutoChecker] âœ… DOCX parsed â€” ${items.length} answers detected successfully`);
+      console.log(`[AutoChecker] ✅ DOCX parsed — ${items.length} answers detected successfully`);
       return { items };
     }
     return {
-      error: 'No readable answer key found in this Word document.\n\nSupported formats:\n  1. A\n  2. B\n  1) True\n  1: photosynthesis\n  A,B,C,D (comma list)\n  [type:enumeration] oxygen, carbon',
+      error: 'No readable answer key found in this Word document.\n\nSupported formats:\n  1. A\n  2. B\n  1) True\n  1: photosynthesis\n  A,B,C,D (comma list)\n  [type:enumeration] oxygen, carbon\n  Or use section headers: MULTIPLE CHOICE ANSWERKEY, IDENTIFICATION ANSWERKEY, etc.',
     };
   }
 
