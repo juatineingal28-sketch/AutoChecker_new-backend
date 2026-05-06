@@ -1,4 +1,4 @@
-// server.js  â€” AutoChecker Backend  (UPGRADED)
+﻿// server.js  â€” AutoChecker Backend  (UPGRADED)
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // What changed vs original:
@@ -1371,7 +1371,7 @@ app.listen(PORT, '0.0.0.0', () => {
 
 // Keep-alive ping â€” prevents Railway from sleeping
 setInterval(() => {
-  fetch('https://autochecker-backend-production.up.railway.app/health')
+  fetch('https://autocheckernew-backend-production.up.railway.app/health')
     .catch(() => {});
 }, 5 * 60 * 1000);
 
