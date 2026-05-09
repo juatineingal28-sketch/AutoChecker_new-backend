@@ -63,7 +63,7 @@ let geminiModel = null;
 if (GoogleGenerativeAI && GEMINI_API_KEY) {
   try {
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-    geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' });
     console.log('[AutoChecker] Gemini 2.0 Flash ready for written answer scanning');
   } catch (e) {
     console.warn('[AutoChecker] Gemini init failed:', e.message);
