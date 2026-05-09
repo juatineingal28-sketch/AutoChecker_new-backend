@@ -604,8 +604,9 @@ const { createWorker, OEM, PSM } = Tesseract;
 // PSM 12 = sparse text with orientation and script detection
 // Very useful for handwritten answer sheets where text is isolated and spread out
 
-const PSM_SEQUENCE_MC   = [4, 6, 3, 11, 12];   // was [4, 6, 3, 11]
-const PSM_SEQUENCE_TEXT = [4, 6, 3, 12];        // was [4, 6, 3]
+// Single-pass PSM for speed — MC still tries 2 modes, text tries only 1
+const PSM_SEQUENCE_MC   = [6, 4];   // PSM6 first (uniform block), PSM4 fallback
+const PSM_SEQUENCE_TEXT = [6];      // PSM6 only — fastest for handwritten answer sheets
 
 // âœ¨ NEW: per-type character whitelists
 // MC:   tight â€” only digits, A-D, separators
@@ -615,48 +616,32 @@ const CHAR_WHITELIST_TEXT = ''; // empty = no restriction
 
 // â”€â”€â”€ Single-worker OCR attempt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-async function tryOcrWithPsm(imageBuffer, psmMode, extraParams = {}) {
-  const worker = await createWorker('eng', OEM?.LSTM_ONLY ?? 1, {
-    logger: m => {
-      if (m.status === 'recognizing text') {
-        process.stdout.write(`\r[Tesseract PSM${psmMode}] ${Math.round(m.progress * 100)}%  `);
-      }
-    },
+// Reusable worker — created once per request, reused across PSM passes (saves ~2s per pass)
+async function tryOcrWithPsm(worker, imageBuffer, psmMode, extraParams = {}) {
+  await worker.setParameters({
+    tessedit_ocr_engine_mode:  OEM?.LSTM_ONLY ?? 1,
+    tessedit_pageseg_mode:     psmMode,
+    preserve_interword_spaces: '1',
+    tessedit_do_invert:        '0',
+    ...extraParams,
   });
-
-  try {
-    await worker.setParameters({
-      tessedit_ocr_engine_mode:  OEM?.LSTM_ONLY ?? 1,
-      tessedit_pageseg_mode:     psmMode,
-      preserve_interword_spaces: '1',
-      tessedit_do_invert:        '0',
-      ...extraParams,
-    });
-
-    const { data: { text, confidence } } = await worker.recognize(imageBuffer);
-    process.stdout.write('\n');
-    return { text: text ?? '', confidence: confidence ?? 0 };
-  } finally {
-    // âœ¨ UPGRADED: always terminate â€” prevents worker leak on error
-    try { await worker.terminate(); } catch {}
-  }
+  const { data: { text, confidence } } = await worker.recognize(imageBuffer);
+  process.stdout.write('\n');
+  return { text: text ?? '', confidence: confidence ?? 0 };
 }
+
 
 // â”€â”€â”€ Multi-PSM Tesseract runner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'bubble_mc') {
-  // ✅ After
-const isMcType = examType === 'bubble_mc' || examType === 'text_mc' || examType === 'bubble_omr' || examType === 'multiple_choice' || examType === 'omr';
+  const isMcType = examType === 'bubble_mc' || examType === 'text_mc' || examType === 'bubble_omr' || examType === 'multiple_choice' || examType === 'omr';
   const psmList     = isMcType ? PSM_SEQUENCE_MC : PSM_SEQUENCE_TEXT;
   const whitelist   = isMcType ? CHAR_WHITELIST_MC : CHAR_WHITELIST_TEXT;
   const imageBuffer = await preprocessImage(imageBase64, mimeType);
 
-  console.log(`[AutoChecker] Multi-PSM OCR start (examType=${examType}, modes=${psmList.join(',')})`);
+  console.log(`[AutoChecker] OCR start (examType=${examType}, modes=${psmList.join(',')})`);
 
   function scoreMcText(text) {
-    // BUG FIX: removed \b word-boundary after the letter.
-    // Tesseract output from handwritten sheets often has noise immediately after
-    // the answer letter (e.g. "1. A." "2. B," "3. C\n") which broke the boundary.
     return (text.match(/[Qq]?\d{1,3}\s*[.):\-\/]?\s*[ABCDabcd](?:\s|[.,;)\n]|$)/g) ?? []).length;
   }
   function scoreTextBlock(text) {
@@ -667,13 +652,21 @@ const isMcType = examType === 'bubble_mc' || examType === 'text_mc' || examType 
   let bestConfidence = 0;
   let bestScore      = -1;
 
-  const extraParams = whitelist
-    ? { tessedit_char_whitelist: whitelist }
-    : {};
+  const extraParams = whitelist ? { tessedit_char_whitelist: whitelist } : {};
 
+  // Create one worker, reuse across all PSM passes
+  const worker = await createWorker('eng', OEM?.LSTM_ONLY ?? 1, {
+    logger: m => {
+      if (m.status === 'recognizing text') {
+        process.stdout.write(`\r[Tesseract] ${Math.round(m.progress * 100)}%  `);
+      }
+    },
+  });
+
+  try {
   for (const psm of psmList) {
     try {
-      const { text, confidence } = await tryOcrWithPsm(imageBuffer, psm, extraParams);
+      const { text, confidence } = await tryOcrWithPsm(worker, imageBuffer, psm, extraParams);
       const preview = (text ?? '').slice(0, 200).replace(/\n/g, 'â†µ');
       console.log(`[Tesseract PSM${psm}] conf=${confidence?.toFixed(1)}% | preview: ${preview}`);
 
@@ -695,46 +688,15 @@ const isMcType = examType === 'bubble_mc' || examType === 'text_mc' || examType 
     }
   }
 
-  // â”€â”€ Inverted-image retry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // âœ¨ UPGRADED: now applies to ALL exam types (not just MC)
-  // Dark background sheets and some ballpen papers benefit from inversion
-  const needsInvertRetry = isMcType ? bestScore < 3 : bestScore < 4;
 
-  if (needsInvertRetry && sharp) {
-    try {
-      console.log('[AutoChecker] Trying inverted imageâ€¦');
-      const invertedBuffer = await sharp(imageBuffer).negate().png().toBuffer();
-      const { text, confidence } = await tryOcrWithPsm(invertedBuffer, 6, extraParams);
-      const score = isMcType ? scoreMcText(text) : scoreTextBlock(text);
-      console.log(`[Tesseract inverted] score=${score}, conf=${confidence?.toFixed(1)}%`);
-      if (score > bestScore) { bestText = text; bestConfidence = confidence; bestScore = score; }
-    } catch (invertErr) {
-      console.warn('[AutoChecker] Inverted retry failed:', invertErr.message);
-    }
+  } finally {
+    try { await worker.terminate(); } catch {}
   }
 
-  // âœ¨ NEW: Adaptive threshold retry
-  // If normal threshold didn't work well, try a lighter threshold (140) for
-  // very faint or lightly-pressed ballpen marks
-  if (bestScore < 2 && sharp) {
-    try {
-      console.log('[AutoChecker] Trying lighter threshold (140) for faint handwritingâ€¦');
-      const lightBuffer = await sharp(Buffer.from(imageBase64, 'base64'))
-        .rotate().greyscale().normalise().sharpen({ sigma: 1.5 }).threshold(140).resize({ width: 2000, fit: 'inside', withoutEnlargement: false }).png().toBuffer();
-      const { text, confidence } = await tryOcrWithPsm(lightBuffer, 6, extraParams);
-      const score = isMcType ? scoreMcText(text) : scoreTextBlock(text);
-      console.log(`[Tesseract light-threshold] score=${score}, conf=${confidence?.toFixed(1)}%`);
-      if (score > bestScore) { bestText = text; bestConfidence = confidence; bestScore = score; }
-    } catch (threshErr) {
-      console.warn('[AutoChecker] Light-threshold retry failed:', threshErr.message);
-    }
-  }
-
-  console.log(`[AutoChecker] Best OCR â€” score=${bestScore}, conf=${bestConfidence?.toFixed?.(1) ?? 'n/a'}%`);
-  console.log('[Tesseract] Final text preview:\n' + bestText.slice(0, 400).replace(/\n/g, 'â†µ'));
-
+  console.log(`[AutoChecker] OCR done — score=${bestScore}, conf=${bestConfidence?.toFixed?.(1) ?? 'n/a'}%`);
   return { text: bestText, engineConfidence: Math.max(bestConfidence, 0) };
 }
+
 
 // â”€â”€â”€ OCR Text Post-processing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
@@ -1250,15 +1212,9 @@ app.post('/api/scan', async (req, res) => {
   if (!imageBase64) return res.status(400).json({ success: false, error: 'imageBase64 is required.' });
   if (!examType)    return res.status(400).json({ success: false, error: 'examType is required.' });
 
-  let totalQs = Number(questionCount) || 0;
-  if (sectionId) {
-    const record = readStore(sectionId);
-    if (record?.key?.length) {
-      totalQs = record.key.length;
-      console.log(`[AutoChecker] Question count from answer key: ${totalQs}`);
-    }
-  }
-  if (!totalQs) totalQs = 10;
+  // Use questionCount from client — it's already derived from the answer key.
+  // Do NOT override with server-side key length; the paper may have fewer questions.
+  const totalQs = Number(questionCount) || 10;
 
   try {
     console.log(`[AutoChecker] Scanning â€” examType=${examType}, questions=${totalQs}`);
