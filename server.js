@@ -47,6 +47,31 @@ const pdfParse = typeof _pdfParseLib === 'function' ? _pdfParseLib : _pdfParseLi
 const mammoth   = require('mammoth');
 const Tesseract = require('tesseract.js');
 
+// Gemini Vision — for identification, enumeration, true_or_false
+// Free tier: 1,500 requests/day, no credit card needed
+// npm install @google/generative-ai
+let GoogleGenerativeAI;
+try {
+  ({ GoogleGenerativeAI } = require('@google/generative-ai'));
+} catch {
+  console.warn('[AutoChecker] @google/generative-ai not installed. Run: npm install @google/generative-ai');
+  console.warn('              Written exam types (identification/enumeration/true_or_false) will fall back to Tesseract.');
+}
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+let geminiModel = null;
+if (GoogleGenerativeAI && GEMINI_API_KEY) {
+  try {
+    const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+    geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    console.log('[AutoChecker] Gemini 1.5 Flash ready for written answer scanning');
+  } catch (e) {
+    console.warn('[AutoChecker] Gemini init failed:', e.message);
+  }
+} else {
+  if (!GEMINI_API_KEY) console.warn('[AutoChecker] GEMINI_API_KEY not set — written types will use Tesseract fallback.');
+}
+
 // sharp is optional â€” gracefully degrade if not installed
 let sharp;
 try {
@@ -1041,10 +1066,103 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
 }
 
 
+// ─── Gemini Vision scanner (identification / enumeration / true_or_false) ────
+//
+// Sends the exam sheet image to Gemini 1.5 Flash with a structured prompt.
+// Gemini reads the handwriting and returns a clean JSON map of answers.
+// Falls back to Tesseract automatically if Gemini is unavailable or fails.
+
+async function scanWithGemini(imageBase64, mimeType, examType, questionCount) {
+  if (!geminiModel) {
+    console.warn('[Gemini] Model not available — falling back to Tesseract');
+    return null;
+  }
+
+  const typeInstructions = {
+    true_or_false: 'Each answer is either "True" or "False" (or "T"/"F"). Return the exact word the student wrote. If blank, use empty string "".',
+    identification: 'Each answer is a handwritten word or short phrase. Copy it exactly as written. If blank, use empty string "".',
+    enumeration: 'Each answer is a handwritten word or short phrase (one item per question number). Copy it exactly as written. If blank, use empty string "".',
+  };
+
+  const instructions = typeInstructions[examType] ?? typeInstructions.identification;
+
+  const prompt = `You are scanning a student exam answer sheet.
+Exam type: ${examType}
+Number of questions: ${questionCount}
+
+${instructions}
+
+Look at every numbered answer box or blank on the sheet (1 to ${questionCount}).
+Return ONLY a valid JSON object — no explanation, no markdown, no extra text:
+{"1":"answer","2":"answer","3":"answer"}
+
+If a question has no visible answer, use an empty string "" for that number.
+Always include all numbers from 1 to ${questionCount}.
+If you can see a student name written at the top, also add "studentName" to the JSON.`;
+
+  try {
+    console.log(`[Gemini] Scanning ${examType} sheet — ${questionCount} questions`);
+
+    const result = await geminiModel.generateContent([
+      { text: prompt },
+      { inlineData: { mimeType: mimeType || 'image/jpeg', data: imageBase64 } },
+    ]);
+
+    const rawText = result.response.text().trim();
+    console.log(`[Gemini] Raw response preview: ${rawText.slice(0, 200)}`);
+
+    const jsonText = rawText
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/\s*```$/, '')
+      .trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch {
+      const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        parsed = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error('Could not parse Gemini JSON response: ' + rawText.slice(0, 100));
+      }
+    }
+
+    const studentName = parsed.studentName ?? null;
+    delete parsed.studentName;
+
+    const answers = {};
+    for (let i = 1; i <= questionCount; i++) {
+      answers[String(i)] = (parsed[String(i)] ?? parsed[i] ?? '').trim();
+    }
+
+    const answeredCount = Object.values(answers).filter(a => a !== '').length;
+    const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
+    const confidence    = Math.min(0.82 + fillRate * 0.15, 0.97);
+
+    console.log(`[Gemini] Done — answered: ${answeredCount}/${questionCount}, confidence: ${(confidence * 100).toFixed(1)}%`);
+    return { studentName, answers, answeredCount, engineConfidence: confidence * 100, confidence };
+
+  } catch (err) {
+    console.error('[Gemini] Scan failed:', err.message);
+    return null;
+  }
+}
+
+// ─── Full OCR pipeline ────────────────────────────────────────────────────────
+//
+// Routing:
+//   bubble_omr            → Jimp pixel detector → Tesseract fallback
+//   multiple_choice       → Tesseract (reliable for printed A/B/C/D letters)
+//   identification        → Gemini Vision → Tesseract fallback
+//   enumeration           → Gemini Vision → Tesseract fallback
+//   true_or_false         → Gemini Vision → Tesseract fallback
+
 async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
-  // ✅ After — recognizes the new 'omr' string too
-const isBubble = examType === 'bubble_mc' || examType === 'bubble_omr' || examType === 'omr';
-const isMcType = isBubble || examType === 'text_mc' || examType === 'multiple_choice';
+  const isBubble  = examType === 'bubble_mc' || examType === 'bubble_omr' || examType === 'omr';
+  const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice';
+  const isWritten = !isMcType;
 
   // ── Route bubble_omr to Jimp pixel detector first ───────────────────────
   if (isBubble) {
@@ -1057,7 +1175,14 @@ const isMcType = isBubble || examType === 'text_mc' || examType === 'multiple_ch
     console.log('[AutoChecker] Falling back to Tesseract for bubble sheet...');
   }
 
-  // ── Tesseract path (text_mc, written types, or bubble fallback) ───────────
+  // ── Route written types to Gemini Vision ────────────────────────────────
+  if (isWritten) {
+    const geminiResult = await scanWithGemini(imageBase64, mimeType, examType, questionCount);
+    if (geminiResult) return geminiResult;
+    console.warn('[AutoChecker] Gemini unavailable — falling back to Tesseract for written answers');
+  }
+
+  // ── Tesseract path (MC, bubble fallback, or written fallback) ───────────
   const { text: rawText, engineConfidence } =
     await runTesseract(imageBase64, mimeType, examType);
 
@@ -1090,7 +1215,7 @@ const isMcType = isBubble || examType === 'text_mc' || examType === 'multiple_ch
   const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
   const confidence    = Math.min(normalizedEng + fillRate * 0.1, 1.0);
 
-  console.log(`[AutoChecker] Parsed — answered: ${answeredCount}/${questionCount}, engine: ${engineConfidence?.toFixed?.(1) ?? 'n/a'}%, composite: ${(confidence * 100).toFixed(1)}%`);
+  console.log(`[AutoChecker] Tesseract parsed — answered: ${answeredCount}/${questionCount}, engine: ${engineConfidence?.toFixed?.(1) ?? 'n/a'}%, composite: ${(confidence * 100).toFixed(1)}%`);
   return { studentName, answers, answeredCount, engineConfidence, confidence };
 }
 function buildEmptyAnswers(count) {
@@ -1401,6 +1526,4 @@ setInterval(() => {
     .catch(() => {});
 }, 5 * 60 * 1000);
 
-// redeploy-trigger-20260505074430
-
-// 202605050613
+// redeploy-trigger-20260509-gemini
