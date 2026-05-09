@@ -63,8 +63,8 @@ let geminiModel = null;
 if (GoogleGenerativeAI && GEMINI_API_KEY) {
   try {
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-    geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' });
-    console.log('[AutoChecker] Gemini 2.0 Flash ready for written answer scanning');
+    geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    console.log('[AutoChecker] Gemini 1.5 Flash ready for written answer scanning');
   } catch (e) {
     console.warn('[AutoChecker] Gemini init failed:', e.message);
   }
@@ -629,20 +629,32 @@ const { createWorker, OEM, PSM } = Tesseract;
 const CHAR_WHITELIST_MC   = '0123456789ABCDabcd.):-/ \n';
 const CHAR_WHITELIST_TEXT = ''; // no restriction for handwritten words
 
-// PSM sequences — first entry is tried first; second is fallback if score is poor
-const PSM_SEQUENCE_MC   = [6, 4];  // PSM6 uniform block first, PSM4 column fallback
-const PSM_SEQUENCE_TEXT = [4, 6];  // PSM4 column first (answer sheets), PSM6 fallback
+// PSM sequences — first entry is tried first; fallbacks follow if score is poor.
+//
+// FIX: PSM modes are now correctly matched to exam type:
+//   MCQ / enumeration → PSM 6  (uniform block of text, best for dense answer sheets)
+//   true/false        → PSM 7  (treat image as a single text line — T/F fits one line)
+//   mixed / fallback  → PSM 11 (sparse text — find as much as possible anywhere)
+//
+// PSM 4 (single column) is kept as a secondary fallback for MC in case the sheet
+// has a narrow single-column layout.
+const PSM_SEQUENCE_MC        = [6, 4];      // MCQ: uniform block → single column
+const PSM_SEQUENCE_TRUEFALSE = [7, 6, 11];  // T/F: single-line → block → sparse
+const PSM_SEQUENCE_TEXT      = [6, 11];     // identification/enumeration: block → sparse
 
 // ─── Persistent worker pool ───────────────────────────────────────────────────
 // Workers are created ONCE at startup and reused across all scan requests.
 // This eliminates the ~2-4s cold-start cost that was paid on every scan.
 //
-// Two workers: one tuned for MC (tight whitelist), one for text (no whitelist).
-// A mutex flag per worker prevents concurrent use — scans queue naturally via
-// async/await since Node is single-threaded.
+// CRITICAL FIX: tessedit_ocr_engine_mode (OEM) must be supplied as the second
+// argument to createWorker() — it selects the engine DLL at load time.
+// Setting it later via setParameters() has NO effect and causes runtime warnings:
+//   "Warning: Parameter not set: tessedit_ocr_engine_mode"
+// The whitelist and PSM, by contrast, ARE runtime parameters and belong in
+// setParameters() / recognize() options — that is intentional and correct.
 
 let workerMC   = null;  // for multiple_choice / bubble_omr
-let workerText = null;  // for identification / enumeration / true_or_false
+let workerText = null;  // for identification / enumeration / true_or_false / true_or_false
 let workerMCReady   = false;
 let workerTextReady = false;
 
@@ -653,20 +665,26 @@ async function initWorkers() {
     }
   };
 
+  // OEM.LSTM_ONLY (= 1) is passed as the second arg to createWorker so it is
+  // applied at engine-init time — NOT via setParameters() after the fact.
+  const OEM_LSTM = OEM?.LSTM_ONLY ?? 1;
+
   try {
-    workerMC = await createWorker('eng', OEM?.LSTM_ONLY ?? 1, { logger: loggerFn });
+    workerMC = await createWorker('eng', OEM_LSTM, { logger: loggerFn });
+    // tessedit_char_whitelist IS a valid runtime parameter — correct to set here.
     await workerMC.setParameters({ tessedit_char_whitelist: CHAR_WHITELIST_MC });
     workerMCReady = true;
-    console.log('[AutoChecker] Tesseract MC worker ready');
+    console.log('[AutoChecker] Tesseract MC worker ready (OEM=LSTM_ONLY, whitelist=MC)');
   } catch (e) {
     console.error('[AutoChecker] MC worker init failed:', e.message);
   }
 
   try {
-    workerText = await createWorker('eng', OEM?.LSTM_ONLY ?? 1, { logger: loggerFn });
+    workerText = await createWorker('eng', OEM_LSTM, { logger: loggerFn });
+    // No whitelist for handwritten text — empty string disables restriction.
     await workerText.setParameters({ tessedit_char_whitelist: CHAR_WHITELIST_TEXT });
     workerTextReady = true;
-    console.log('[AutoChecker] Tesseract Text worker ready');
+    console.log('[AutoChecker] Tesseract Text worker ready (OEM=LSTM_ONLY, whitelist=none)');
   } catch (e) {
     console.error('[AutoChecker] Text worker init failed:', e.message);
   }
@@ -677,9 +695,18 @@ async function initWorkers() {
 initWorkers().catch(e => console.error('[AutoChecker] Worker pool init error:', e.message));
 
 // ─── OCR with persistent worker ───────────────────────────────────────────────
+//
+// CRITICAL FIX: tessedit_ocr_engine_mode is intentionally removed from this
+// setParameters() call. OEM is an engine-selection flag that only takes effect
+// at worker creation (createWorker's 2nd argument). Calling setParameters with
+// it at recognition time produces:
+//   "Warning: Parameter not set: tessedit_ocr_engine_mode"
+// and wastes a round-trip to the worker. It is now set correctly in initWorkers().
+//
+// tessedit_pageseg_mode (PSM) and preserve_interword_spaces ARE valid runtime
+// parameters — they are applied per-recognition call, which is correct.
 async function tryOcrWithPsm(worker, imageBuffer, psmMode, extraParams = {}) {
   await worker.setParameters({
-    tessedit_ocr_engine_mode:  OEM?.LSTM_ONLY ?? 1,
     tessedit_pageseg_mode:     psmMode,
     preserve_interword_spaces: '1',
     tessedit_do_invert:        '0',
@@ -694,9 +721,17 @@ async function tryOcrWithPsm(worker, imageBuffer, psmMode, extraParams = {}) {
 async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'multiple_choice') {
   const isMcType = examType === 'bubble_mc' || examType === 'text_mc' ||
                    examType === 'bubble_omr' || examType === 'multiple_choice' || examType === 'omr';
+  const isTrueFalse = examType === 'true_or_false' || examType === 'truefalse';
 
-  const psmList   = isMcType ? PSM_SEQUENCE_MC : PSM_SEQUENCE_TEXT;
-  const whitelist = isMcType ? CHAR_WHITELIST_MC : CHAR_WHITELIST_TEXT;
+  // Select PSM sequence and whitelist by exam type.
+  // PSM 7 for true/false (single line per answer) prevents Tesseract from trying
+  // to detect multi-column layout and missing isolated T/F tokens.
+  let psmList;
+  if (isMcType)      psmList = PSM_SEQUENCE_MC;
+  else if (isTrueFalse) psmList = PSM_SEQUENCE_TRUEFALSE;
+  else               psmList = PSM_SEQUENCE_TEXT;
+
+  const whitelist   = isMcType ? CHAR_WHITELIST_MC : CHAR_WHITELIST_TEXT;
   const extraParams = whitelist ? { tessedit_char_whitelist: whitelist } : {};
 
   // ── Sharp + worker selection run concurrently ─────────────────────────────
@@ -705,8 +740,9 @@ async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'mu
   const [imageBuffer, worker] = await Promise.all([
     preprocessImage(imageBase64, mimeType, examType),
     (async () => {
-      // Use persistent worker if ready, otherwise spin up a temporary one
-      if (isMcType && workerMCReady)   return { w: workerMC,   temp: false };
+      // Use persistent worker if ready, otherwise spin up a temporary one.
+      // FIX: temporary worker also receives OEM_LSTM as the 2nd createWorker arg.
+      if (isMcType && workerMCReady)    return { w: workerMC,   temp: false };
       if (!isMcType && workerTextReady) return { w: workerText, temp: false };
       console.warn('[AutoChecker] Persistent worker not ready — creating temporary worker');
       const w = await createWorker('eng', OEM?.LSTM_ONLY ?? 1);
@@ -1152,12 +1188,32 @@ If you can see a student name written at the top, also add "studentName" to the 
 
 // ─── Full OCR pipeline ────────────────────────────────────────────────────────
 //
+// ARCHITECTURE FIX — OCR-first, Gemini-optional pipeline:
+//
+//   OLD (broken):  Gemini → [fail] → Tesseract fallback
+//     Problem: Gemini was a REQUIRED step. A 404 from an invalid model name
+//     (e.g. "gemini-1.5-flasht") forced every scan through the slow cold-start
+//     fallback path. The whole pipeline degraded silently.
+//
+//   NEW (correct): Tesseract (always) → Gemini enhancement (optional, if key set)
+//     1. Tesseract always runs — it is the primary, authoritative OCR engine.
+//     2. Gemini only runs afterward as a post-processor IF:
+//        a. GEMINI_API_KEY is set in the environment, AND
+//        b. geminiModel was initialised successfully, AND
+//        c. Tesseract fill-rate is below the GEMINI_ASSIST_THRESHOLD
+//           (meaning Tesseract found fewer answers than expected — Gemini can help)
+//     3. When Gemini runs, it only fills answers that Tesseract left BLANK.
+//        It never overwrites a Tesseract-detected answer with a Gemini guess.
+//     4. If Gemini fails (network error, quota, wrong key) the Tesseract result
+//        is returned unchanged — the scan still succeeds.
+//
 // Routing:
-//   bubble_omr            → Jimp pixel detector → Tesseract fallback
-//   multiple_choice       → Tesseract (reliable for printed A/B/C/D letters)
-//   identification        → Gemini Vision → Tesseract fallback
-//   enumeration           → Gemini Vision → Tesseract fallback
-//   true_or_false         → Gemini Vision → Tesseract fallback
+//   bubble_omr      → Jimp pixel detector → Tesseract fallback
+//   all other types → Tesseract (primary) → Gemini fill-in (optional enhancer)
+
+// Threshold: if Tesseract answered at least this fraction of questions, skip Gemini.
+// At 70%+ fill-rate the OCR result is already solid — no need to pay Gemini latency.
+const GEMINI_ASSIST_THRESHOLD = 0.70;
 
 async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
   const isBubble  = examType === 'bubble_mc' || examType === 'bubble_omr' || examType === 'omr';
@@ -1175,14 +1231,7 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
     console.log('[AutoChecker] Falling back to Tesseract for bubble sheet...');
   }
 
-  // ── Route written types to Gemini Vision ────────────────────────────────
-  if (isWritten) {
-    const geminiResult = await scanWithGemini(imageBase64, mimeType, examType, questionCount);
-    if (geminiResult) return geminiResult;
-    console.warn('[AutoChecker] Gemini unavailable — falling back to Tesseract for written answers');
-  }
-
-  // ── Tesseract path (MC, bubble fallback, or written fallback) ───────────
+  // ── STEP 1: Tesseract (always runs — primary engine) ────────────────────
   const { text: rawText, engineConfidence } =
     await runTesseract(imageBase64, mimeType, examType);
 
@@ -1206,16 +1255,62 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
     });
   }
 
+  // Ensure all question slots exist (empty string for blanks)
   for (let i = 1; i <= questionCount; i++) {
     if (!answers[String(i)]) answers[String(i)] = '';
   }
 
+  const tesseractAnsweredCount = Object.values(answers).filter(a => a !== '').length;
+  const fillRate = questionCount > 0 ? tesseractAnsweredCount / questionCount : 0;
+
+  console.log(`[AutoChecker] Tesseract parsed — answered: ${tesseractAnsweredCount}/${questionCount}, engine: ${engineConfidence?.toFixed?.(1) ?? 'n/a'}%, fillRate: ${(fillRate * 100).toFixed(1)}%`);
+
+  // ── STEP 2: Gemini enhancement (optional, written types only) ───────────
+  // Gemini only activates when:
+  //   • exam type is written (not MC / bubble)
+  //   • geminiModel is available (API key set + init succeeded)
+  //   • Tesseract fill-rate is below threshold (OCR left too many blanks)
+  //
+  // When active, Gemini only fills blank slots — never overwrites OCR answers.
+  if (isWritten && geminiModel && fillRate < GEMINI_ASSIST_THRESHOLD) {
+    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% < ${GEMINI_ASSIST_THRESHOLD * 100}% — trying Gemini enhancement`);
+    try {
+      const geminiResult = await scanWithGemini(imageBase64, mimeType, examType, questionCount);
+      if (geminiResult) {
+        let geminiFilledCount = 0;
+        for (let i = 1; i <= questionCount; i++) {
+          const key = String(i);
+          // Only accept Gemini's answer for slots that Tesseract left blank
+          if (!answers[key] && geminiResult.answers[key]) {
+            answers[key] = geminiResult.answers[key];
+            geminiFilledCount++;
+          }
+        }
+        // Accept Gemini's student name if Tesseract didn't find one
+        const finalStudentName = studentName ?? geminiResult.studentName ?? null;
+        const finalAnsweredCount = Object.values(answers).filter(a => a !== '').length;
+        console.log(`[AutoChecker] Gemini filled ${geminiFilledCount} blank answer(s) — total: ${finalAnsweredCount}/${questionCount}`);
+
+        const normalizedEng = Math.max((engineConfidence ?? 0), 0) / 100;
+        const finalFillRate = questionCount > 0 ? finalAnsweredCount / questionCount : 0;
+        const confidence    = Math.min(normalizedEng * 0.6 + finalFillRate * 0.4, 1.0);
+        return { studentName: finalStudentName, answers, answeredCount: finalAnsweredCount, engineConfidence, confidence };
+      }
+    } catch (geminiErr) {
+      // Gemini failure is non-fatal — Tesseract result stands
+      console.warn('[AutoChecker] Gemini enhancement failed (non-fatal):', geminiErr.message);
+    }
+  } else if (isWritten && geminiModel) {
+    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% ≥ ${GEMINI_ASSIST_THRESHOLD * 100}% — Gemini enhancement skipped (not needed)`);
+  }
+
+  // ── Return Tesseract-only result ─────────────────────────────────────────
   const answeredCount = Object.values(answers).filter(a => a !== '').length;
   const normalizedEng = Math.max((engineConfidence ?? 0), 0) / 100;
-  const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
-  const confidence    = Math.min(normalizedEng + fillRate * 0.1, 1.0);
+  const finalFillRate = questionCount > 0 ? answeredCount / questionCount : 0;
+  const confidence    = Math.min(normalizedEng + finalFillRate * 0.1, 1.0);
 
-  console.log(`[AutoChecker] Tesseract parsed — answered: ${answeredCount}/${questionCount}, engine: ${engineConfidence?.toFixed?.(1) ?? 'n/a'}%, composite: ${(confidence * 100).toFixed(1)}%`);
+  console.log(`[AutoChecker] Final result — answered: ${answeredCount}/${questionCount}, composite confidence: ${(confidence * 100).toFixed(1)}%`);
   return { studentName, answers, answeredCount, engineConfidence, confidence };
 }
 function buildEmptyAnswers(count) {
@@ -1505,7 +1600,11 @@ app.get('/health', (_req, res) => res.json({
   sharp:  !!sharp,
   ocr:    'tesseract.js',
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
-  version: '2.1-smartparser',
+  gemini: geminiModel
+    ? `enabled (${process.env.GEMINI_MODEL || 'gemini-1.5-flash'}) — post-processing enhancer only`
+    : 'disabled (GEMINI_API_KEY not set — OCR runs standalone)',
+  pipeline: 'tesseract-primary / gemini-optional-enhancer',
+  version: '2.2-ocr-primary',
 }));
 
 // Error handler
@@ -1515,9 +1614,10 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`âœ… AutoChecker v2.0 running on http://0.0.0.0:${PORT}`);
-  console.log(`ðŸ“· OCR: Tesseract.js (LSTM) + ${sharp ? 'sharp pre-processing âœ“' : 'NO sharp â€” install: npm install sharp'}`);
-  console.log(`âœï¸  Handwriting support: ${sharp ? 'ENABLED' : 'LIMITED (install sharp)'}`);
+  console.log('[AutoChecker] v2.2 running on http://0.0.0.0:' + PORT);
+  console.log('[AutoChecker] OCR: Tesseract.js LSTM (OEM set at worker init) + ' + (sharp ? 'sharp preprocessing enabled' : 'NO sharp -- run: npm install sharp'));
+  console.log('[AutoChecker] Gemini: ' + (geminiModel ? 'ENABLED as post-processing enhancer (' + (process.env.GEMINI_MODEL || 'gemini-1.5-flash') + ')' : 'DISABLED -- OCR-only mode active'));
+  console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
 });
 
 // Keep-alive ping â€” prevents Railway from sleeping
@@ -1526,4 +1626,4 @@ setInterval(() => {
     .catch(() => {});
 }, 5 * 60 * 1000);
 
-// redeploy-trigger-20260509-gemini 
+// redeploy-trigger-20260509-gemini
