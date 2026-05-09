@@ -600,23 +600,58 @@ async function preprocessImage(base64, mimeType) {
 
 const { createWorker, OEM, PSM } = Tesseract;
 
-// âœ¨ UPGRADED: extended PSM sequences
-// PSM 12 = sparse text with orientation and script detection
-// Very useful for handwritten answer sheets where text is isolated and spread out
-
-// Single-pass PSM for speed — MC still tries 2 modes, text tries only 1
-const PSM_SEQUENCE_MC   = [6, 4];   // PSM6 first (uniform block), PSM4 fallback
-const PSM_SEQUENCE_TEXT = [6];      // PSM6 only — fastest for handwritten answer sheets
-
-// âœ¨ NEW: per-type character whitelists
-// MC:   tight â€” only digits, A-D, separators
-// Text: none  â€” don't restrict handwritten words
+// ─── Character whitelists ─────────────────────────────────────────────────────
 const CHAR_WHITELIST_MC   = '0123456789ABCDabcd.):-/ \n';
-const CHAR_WHITELIST_TEXT = ''; // empty = no restriction
+const CHAR_WHITELIST_TEXT = ''; // no restriction for handwritten words
 
-// â”€â”€â”€ Single-worker OCR attempt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// PSM sequences — first entry is tried first; second is fallback if score is poor
+const PSM_SEQUENCE_MC   = [6, 4];  // PSM6 uniform block first, PSM4 column fallback
+const PSM_SEQUENCE_TEXT = [4, 6];  // PSM4 column first (answer sheets), PSM6 fallback
 
-// Reusable worker — created once per request, reused across PSM passes (saves ~2s per pass)
+// ─── Persistent worker pool ───────────────────────────────────────────────────
+// Workers are created ONCE at startup and reused across all scan requests.
+// This eliminates the ~2-4s cold-start cost that was paid on every scan.
+//
+// Two workers: one tuned for MC (tight whitelist), one for text (no whitelist).
+// A mutex flag per worker prevents concurrent use — scans queue naturally via
+// async/await since Node is single-threaded.
+
+let workerMC   = null;  // for multiple_choice / bubble_omr
+let workerText = null;  // for identification / enumeration / true_or_false
+let workerMCReady   = false;
+let workerTextReady = false;
+
+async function initWorkers() {
+  const loggerFn = m => {
+    if (m.status === 'recognizing text') {
+      process.stdout.write(`\r[Tesseract] ${Math.round(m.progress * 100)}%  `);
+    }
+  };
+
+  try {
+    workerMC = await createWorker('eng', OEM?.LSTM_ONLY ?? 1, { logger: loggerFn });
+    await workerMC.setParameters({ tessedit_char_whitelist: CHAR_WHITELIST_MC });
+    workerMCReady = true;
+    console.log('[AutoChecker] Tesseract MC worker ready');
+  } catch (e) {
+    console.error('[AutoChecker] MC worker init failed:', e.message);
+  }
+
+  try {
+    workerText = await createWorker('eng', OEM?.LSTM_ONLY ?? 1, { logger: loggerFn });
+    await workerText.setParameters({ tessedit_char_whitelist: CHAR_WHITELIST_TEXT });
+    workerTextReady = true;
+    console.log('[AutoChecker] Tesseract Text worker ready');
+  } catch (e) {
+    console.error('[AutoChecker] Text worker init failed:', e.message);
+  }
+}
+
+// Start warming up workers immediately — don't await, server starts instantly
+// and workers will be ready by the time the first scan arrives.
+initWorkers().catch(e => console.error('[AutoChecker] Worker pool init error:', e.message));
+
+// ─── OCR with persistent worker ───────────────────────────────────────────────
 async function tryOcrWithPsm(worker, imageBuffer, psmMode, extraParams = {}) {
   await worker.setParameters({
     tessedit_ocr_engine_mode:  OEM?.LSTM_ONLY ?? 1,
@@ -630,16 +665,33 @@ async function tryOcrWithPsm(worker, imageBuffer, psmMode, extraParams = {}) {
   return { text: text ?? '', confidence: confidence ?? 0 };
 }
 
+// ─── Main Tesseract runner ────────────────────────────────────────────────────
+async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'multiple_choice') {
+  const isMcType = examType === 'bubble_mc' || examType === 'text_mc' ||
+                   examType === 'bubble_omr' || examType === 'multiple_choice' || examType === 'omr';
 
-// â”€â”€â”€ Multi-PSM Tesseract runner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  const psmList   = isMcType ? PSM_SEQUENCE_MC : PSM_SEQUENCE_TEXT;
+  const whitelist = isMcType ? CHAR_WHITELIST_MC : CHAR_WHITELIST_TEXT;
+  const extraParams = whitelist ? { tessedit_char_whitelist: whitelist } : {};
 
-async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'bubble_mc') {
-  const isMcType = examType === 'bubble_mc' || examType === 'text_mc' || examType === 'bubble_omr' || examType === 'multiple_choice' || examType === 'omr';
-  const psmList     = isMcType ? PSM_SEQUENCE_MC : PSM_SEQUENCE_TEXT;
-  const whitelist   = isMcType ? CHAR_WHITELIST_MC : CHAR_WHITELIST_TEXT;
-  const imageBuffer = await preprocessImage(imageBase64, mimeType);
+  // ── Sharp + worker selection run concurrently ─────────────────────────────
+  // preprocessImage is CPU-bound; worker selection is instant.
+  // Running them together hides any remaining sharp latency.
+  const [imageBuffer, worker] = await Promise.all([
+    preprocessImage(imageBase64, mimeType, examType),
+    (async () => {
+      // Use persistent worker if ready, otherwise spin up a temporary one
+      if (isMcType && workerMCReady)   return { w: workerMC,   temp: false };
+      if (!isMcType && workerTextReady) return { w: workerText, temp: false };
+      console.warn('[AutoChecker] Persistent worker not ready — creating temporary worker');
+      const w = await createWorker('eng', OEM?.LSTM_ONLY ?? 1);
+      return { w, temp: true };
+    })(),
+  ]);
 
-  console.log(`[AutoChecker] OCR start (examType=${examType}, modes=${psmList.join(',')})`);
+  const { w, temp } = worker;
+
+  console.log(`[AutoChecker] OCR start — examType=${examType}, PSM=${psmList.join(',')}, worker=${temp ? 'temp' : 'pooled'}`);
 
   function scoreMcText(text) {
     return (text.match(/[Qq]?\d{1,3}\s*[.):\-\/]?\s*[ABCDabcd](?:\s|[.,;)\n]|$)/g) ?? []).length;
@@ -652,45 +704,63 @@ async function runTesseract(imageBase64, mimeType = 'image/jpeg', examType = 'bu
   let bestConfidence = 0;
   let bestScore      = -1;
 
-  const extraParams = whitelist ? { tessedit_char_whitelist: whitelist } : {};
-
-  // Create one worker, reuse across all PSM passes
-  const worker = await createWorker('eng', OEM?.LSTM_ONLY ?? 1, {
-    logger: m => {
-      if (m.status === 'recognizing text') {
-        process.stdout.write(`\r[Tesseract] ${Math.round(m.progress * 100)}%  `);
-      }
-    },
-  });
-
   try {
-  for (const psm of psmList) {
-    try {
-      const { text, confidence } = await tryOcrWithPsm(worker, imageBuffer, psm, extraParams);
-      const preview = (text ?? '').slice(0, 200).replace(/\n/g, 'â†µ');
-      console.log(`[Tesseract PSM${psm}] conf=${confidence?.toFixed(1)}% | preview: ${preview}`);
+    for (const psm of psmList) {
+      try {
+        const { text, confidence } = await tryOcrWithPsm(w, imageBuffer, psm, extraParams);
+        const preview = (text ?? '').slice(0, 200).replace(/\n/g, '\u21b5');
+        console.log(`[Tesseract PSM${psm}] conf=${confidence?.toFixed(1)}% | preview: ${preview}`);
 
-      const score = isMcType ? scoreMcText(text) : scoreTextBlock(text);
-      console.log(`[Tesseract PSM${psm}] score=${score} answers found`);
+        const score = isMcType ? scoreMcText(text) : scoreTextBlock(text);
+        console.log(`[Tesseract PSM${psm}] score=${score}`);
 
-      if (score > bestScore || (score === bestScore && confidence > bestConfidence)) {
-        bestText       = text;
-        bestConfidence = confidence;
-        bestScore      = score;
+        if (score > bestScore || (score === bestScore && confidence > bestConfidence)) {
+          bestText       = text;
+          bestConfidence = confidence;
+          bestScore      = score;
+        }
+
+        // Early exit — first PSM pass scored well enough, skip fallback
+        // MC: 3+ answers found is a strong enough signal (was 5, lowered for speed)
+        // Text: 6+ non-empty lines is sufficient
+        if (isMcType  && score >= 3) break;
+        if (!isMcType && score >= 6) break;
+
+      } catch (psmErr) {
+        console.warn(`[Tesseract PSM${psm}] failed: ${psmErr.message}`);
       }
-
-      // Early exit: strong signal we have a good read
-      if (isMcType && score >= 5) break;
-      if (!isMcType && score >= 8) break;
-
-    } catch (psmErr) {
-      console.warn(`[Tesseract PSM${psm}] failed: ${psmErr.message}`);
     }
-  }
 
+    // ── Inverted-image retry (only when forward pass scored very poorly) ──────
+    const INVERT_THRESHOLD = isMcType ? 2 : 4;
+    if (bestScore < INVERT_THRESHOLD) {
+      try {
+        let invertedBuffer;
+        if (sharp) {
+          invertedBuffer = await sharp(imageBuffer).negate({ alpha: false }).png().toBuffer();
+        } else {
+          const buf = Buffer.from(imageBuffer);
+          for (let i = 0; i < buf.length; i++) buf[i] = 255 - buf[i];
+          invertedBuffer = buf;
+        }
+        const invertPsm = isMcType ? 6 : 4;
+        const { text: invText, confidence: invConf } = await tryOcrWithPsm(w, invertedBuffer, invertPsm, extraParams);
+        const invScore = isMcType ? scoreMcText(invText) : scoreTextBlock(invText);
+        console.log(`[Tesseract INVERTED PSM${invertPsm}] conf=${invConf?.toFixed(1)}% score=${invScore}`);
+        if (invScore > bestScore || (invScore === bestScore && invConf > bestConfidence)) {
+          bestText = invText; bestConfidence = invConf; bestScore = invScore;
+          console.log('[AutoChecker] Inverted image gave better result');
+        }
+      } catch (invErr) {
+        console.warn('[AutoChecker] Inverted retry failed:', invErr.message);
+      }
+    }
 
   } finally {
-    try { await worker.terminate(); } catch {}
+    // Only terminate temporary workers — persistent pool workers stay alive
+    if (temp) {
+      try { await w.terminate(); } catch {}
+    }
   }
 
   console.log(`[AutoChecker] OCR done — score=${bestScore}, conf=${bestConfidence?.toFixed?.(1) ?? 'n/a'}%`);
