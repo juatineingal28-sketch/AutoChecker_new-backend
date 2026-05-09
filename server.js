@@ -59,18 +59,55 @@ try {
 }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-let geminiModel = null;
-if (GoogleGenerativeAI && GEMINI_API_KEY) {
-  try {
-    const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-    geminiModel = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-    console.log('[AutoChecker] Gemini 1.5 Flash ready for written answer scanning');
-  } catch (e) {
-    console.warn('[AutoChecker] Gemini init failed:', e.message);
+let geminiModel     = null;
+let geminiModelName = null;
+
+// Models tried in priority order — first one that responds without 404 wins.
+// This handles free-tier keys, regional restrictions, and future deprecations
+// without requiring a code change.
+const GEMINI_MODEL_CANDIDATES = [
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-pro',
+];
+
+async function initGemini() {
+  if (!GoogleGenerativeAI || !GEMINI_API_KEY) {
+    if (!GEMINI_API_KEY) console.warn('[AutoChecker] GEMINI_API_KEY not set — written types will use Tesseract fallback.');
+    return;
   }
-} else {
-  if (!GEMINI_API_KEY) console.warn('[AutoChecker] GEMINI_API_KEY not set — written types will use Tesseract fallback.');
+
+  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
+  for (const candidate of GEMINI_MODEL_CANDIDATES) {
+    try {
+      const model = genAI.getGenerativeModel({ model: candidate });
+      // Lightweight probe: generate a single token to confirm the model is
+      // accessible on this API key. Fails fast (< 2s) on 404/403.
+      await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+        generationConfig: { maxOutputTokens: 1 },
+      });
+      // If we reach here the model responded — use it
+      geminiModel     = model;
+      geminiModelName = candidate;
+      console.log(`[AutoChecker] Gemini ready — model: ${candidate}`);
+      return;
+    } catch (e) {
+      const reason = e.message?.includes('404') ? 'not available on this key' :
+                     e.message?.includes('403') ? 'permission denied' :
+                     e.message?.slice(0, 60);
+      console.warn(`[AutoChecker] Gemini model "${candidate}" skipped: ${reason}`);
+    }
+  }
+
+  console.warn('[AutoChecker] No Gemini model available — all candidates failed. Written types will use Tesseract only.');
 }
+
+// Run probe at startup; does not block server from starting
+initGemini().catch(e => console.warn('[AutoChecker] Gemini init error:', e.message));
 
 // sharp is optional â€” gracefully degrade if not installed
 let sharp;
@@ -1601,10 +1638,10 @@ app.get('/health', (_req, res) => res.json({
   ocr:    'tesseract.js',
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   gemini: geminiModel
-    ? `enabled (${process.env.GEMINI_MODEL || 'gemini-1.5-flash'}) — post-processing enhancer only`
-    : 'disabled (GEMINI_API_KEY not set — OCR runs standalone)',
+    ? `enabled (${geminiModelName}) — post-processing enhancer only`
+    : GEMINI_API_KEY ? 'disabled (no model available for this API key)' : 'disabled (GEMINI_API_KEY not set)',
   pipeline: 'tesseract-primary / gemini-optional-enhancer',
-  version: '2.2-ocr-primary',
+  version: '2.3-gemini-probe',
 }));
 
 // Error handler
@@ -1614,9 +1651,9 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('[AutoChecker] v2.2 running on http://0.0.0.0:' + PORT);
+  console.log('[AutoChecker] v2.3 running on http://0.0.0.0:' + PORT);
   console.log('[AutoChecker] OCR: Tesseract.js LSTM (OEM set at worker init) + ' + (sharp ? 'sharp preprocessing enabled' : 'NO sharp -- run: npm install sharp'));
-  console.log('[AutoChecker] Gemini: ' + (geminiModel ? 'ENABLED as post-processing enhancer (' + (process.env.GEMINI_MODEL || 'gemini-1.5-flash') + ')' : 'DISABLED -- OCR-only mode active'));
+  console.log('[AutoChecker] Gemini: probing available models...');
   console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
 });
 
