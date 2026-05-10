@@ -1719,6 +1719,153 @@ app.post('/api/score/:sectionId', (req, res) => {
     score: correct, total, percentage: pct, status: pct >= 75 ? 'Passed' : pct >= 60 ? 'Review' : 'Failed', details });
 });
 
+// ─── Multi-page scan — stitch pages then scan once ───────────────────────────
+//
+// POST /api/scan-multi
+// Accepts multiple base64 images (one per page), stitches them vertically
+// with Sharp into one tall image, then runs ONE Groq/Tesseract scan.
+//
+// Body: {
+//   pages: [ { imageBase64, mimeType }, ... ],
+//   examType, questionCount, questionTypeMap, mixedMode
+// }
+
+app.post('/api/scan-multi', async (req, res) => {
+  const { pages, examType, questionCount, questionTypeMap, mixedMode } = req.body;
+
+  if (!pages || !Array.isArray(pages) || pages.length === 0) {
+    return res.status(400).json({ success: false, error: 'pages array is required.' });
+  }
+  if (!examType) {
+    return res.status(400).json({ success: false, error: 'examType is required.' });
+  }
+
+  const totalQs = Number(questionCount) || 10;
+
+  try {
+    console.log(`[AutoChecker] scan-multi — ${pages.length} page(s), examType=${examType}, questions=${totalQs}`);
+
+    let finalImageBase64;
+    let finalMimeType = 'image/png';
+
+    if (pages.length === 1) {
+      finalImageBase64 = pages[0].imageBase64;
+      finalMimeType    = pages[0].mimeType || 'image/jpeg';
+      console.log('[scan-multi] Single page — skipping stitch');
+
+    } else {
+      if (!sharp) {
+        return res.status(500).json({
+          success: false,
+          error: 'sharp is not installed. Run: npm install sharp',
+        });
+      }
+
+      console.log(`[scan-multi] Stitching ${pages.length} pages vertically...`);
+
+      const rawBuffers  = pages.map(p => Buffer.from(p.imageBase64, 'base64'));
+      const metadatas   = await Promise.all(rawBuffers.map(buf => sharp(buf).metadata()));
+      const targetWidth = Math.max(...metadatas.map(m => m.width ?? 0));
+
+      const resizedBuffers = await Promise.all(
+        rawBuffers.map(buf =>
+          sharp(buf)
+            .rotate()
+            .resize({
+              width:              targetWidth,
+              fit:                'contain',
+              background:         { r: 255, g: 255, b: 255, alpha: 1 },
+              withoutEnlargement: false,
+            })
+            .png()
+            .toBuffer()
+        )
+      );
+
+      const resizedMetas = await Promise.all(
+        resizedBuffers.map(buf => sharp(buf).metadata())
+      );
+
+      let yOffset = 0;
+      const compositeInputs = resizedBuffers.map((buf, i) => {
+        const entry = { input: buf, top: yOffset, left: 0 };
+        yOffset += resizedMetas[i].height ?? 0;
+        return entry;
+      });
+
+      const totalHeight = yOffset;
+      console.log(`[scan-multi] Canvas: ${targetWidth}x${totalHeight}px`);
+
+      const stitchedBuffer = await sharp({
+        create: {
+          width:      targetWidth,
+          height:     totalHeight,
+          channels:   3,
+          background: { r: 255, g: 255, b: 255 },
+        },
+      })
+        .composite(compositeInputs)
+        .png()
+        .toBuffer();
+
+      finalImageBase64 = stitchedBuffer.toString('base64');
+      finalMimeType    = 'image/png';
+      console.log(`[scan-multi] Stitch complete — ${(stitchedBuffer.length / 1024).toFixed(1)} KB`);
+    }
+
+    const { studentName, answers, answeredCount, engineConfidence, confidence } =
+      await parseVisionText(
+        finalImageBase64, finalMimeType, examType, totalQs,
+        questionTypeMap, mixedMode
+      );
+
+    let notes = '';
+    if (confidence < 0.3) {
+      notes = 'Very low confidence — image may be blurry or dark. Please retake in good lighting.';
+    } else if (confidence < 0.55) {
+      notes = 'Low confidence — some answers may be missing. Review before saving.';
+    } else if (confidence < 0.8) {
+      notes = 'Moderate confidence — please verify the detected answers.';
+    }
+
+    if (answeredCount === 0 && confidence < 0.1) {
+      return res.json({
+        success:        false,
+        error:          'The scanner could not read any answers.\n\nTips:\n• Use bright, even lighting\n• Hold camera directly above the sheet\n• Keep the page flat with no shadows or folds',
+        answers:        buildEmptyAnswers(totalQs),
+        confidence:     0,
+        engineConfidence,
+        answeredCount:  0,
+        totalQuestions: totalQs,
+        notes,
+      });
+    }
+
+    res.json({
+      success:        true,
+      answers,
+      studentName,
+      confidence,
+      engineConfidence,
+      answeredCount,
+      totalQuestions: totalQs,
+      notes,
+    });
+
+  } catch (err) {
+    console.error('[scan-multi] Error:', err.message);
+    res.status(500).json({
+      success:        false,
+      error:          err.message,
+      answers:        buildEmptyAnswers(totalQs || 10),
+      confidence:     0,
+      answeredCount:  0,
+      totalQuestions: totalQs || 10,
+      notes:          'Scan failed. Please try again.',
+    });
+  }
+});
+
 // â”€â”€â”€ Scan â€” upgraded OCR pipeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // âœ¨ UPGRADED: returns { success: false, answers: {}, confidence: 0 }
