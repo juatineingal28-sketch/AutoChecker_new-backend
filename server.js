@@ -1036,7 +1036,10 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
   let image;
   try {
     const buf = Buffer.from(imageBase64, 'base64');
-    image = await Jimp.read(buf);
+    // FIX: Jimp v1+ removed Jimp.read() — use Jimp.fromBuffer() instead.
+    // Pinned to jimp@0.22.12 in package.json so Jimp.read() still works,
+    // but fromBuffer is used here as a forward-compatible safety measure.
+    image = await (Jimp.fromBuffer ? Jimp.fromBuffer(buf) : Jimp.read(buf));
   } catch (err) {
     console.warn('[BubbleOMR] Failed to decode image:', err.message);
     return null;
