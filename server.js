@@ -47,67 +47,35 @@ const pdfParse = typeof _pdfParseLib === 'function' ? _pdfParseLib : _pdfParseLi
 const mammoth   = require('mammoth');
 const Tesseract = require('tesseract.js');
 
-// Gemini Vision — for identification, enumeration, true_or_false
-// Free tier: 1,500 requests/day, no credit card needed
-// npm install @google/generative-ai
-let GoogleGenerativeAI;
-try {
-  ({ GoogleGenerativeAI } = require('@google/generative-ai'));
-} catch {
-  console.warn('[AutoChecker] @google/generative-ai not installed. Run: npm install @google/generative-ai');
-  console.warn('              Written exam types (identification/enumeration/true_or_false) will fall back to Tesseract.');
-}
+// Groq Vision — FREE replacement for Gemini (14,400 requests/day, no credit card)
+// Sign up at console.groq.com → API Keys → Create Key
+// Add GROQ_API_KEY to your Railway environment variables
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+let groqReady = false;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-let geminiModel     = null;
-let geminiModelName = null;
-
-// Models tried in priority order — first one that responds without 404 wins.
-// This handles free-tier keys, regional restrictions, and future deprecations
-// without requiring a code change.
-const GEMINI_MODEL_CANDIDATES = [
-  'gemini-1.5-flash',
-  'gemini-1.5-pro',
-  'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
-  'gemini-pro',
-];
-
-async function initGemini() {
-  if (!GoogleGenerativeAI || !GEMINI_API_KEY) {
-    if (!GEMINI_API_KEY) console.warn('[AutoChecker] GEMINI_API_KEY not set — written types will use Tesseract fallback.');
+async function initGroq() {
+  if (!GROQ_API_KEY) {
+    console.warn('[AutoChecker] GROQ_API_KEY not set — written types will use Tesseract only.');
+    console.warn('              Get a free key at console.groq.com and add GROQ_API_KEY to Railway.');
     return;
   }
-
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-
-  for (const candidate of GEMINI_MODEL_CANDIDATES) {
-    try {
-      const model = genAI.getGenerativeModel({ model: candidate });
-      // Lightweight probe: generate a single token to confirm the model is
-      // accessible on this API key. Fails fast (< 2s) on 404/403.
-      await model.generateContent({
-        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
-        generationConfig: { maxOutputTokens: 1 },
-      });
-      // If we reach here the model responded — use it
-      geminiModel     = model;
-      geminiModelName = candidate;
-      console.log(`[AutoChecker] Gemini ready — model: ${candidate}`);
-      return;
-    } catch (e) {
-      const reason = e.message?.includes('404') ? 'not available on this key' :
-                     e.message?.includes('403') ? 'permission denied' :
-                     e.message?.slice(0, 60);
-      console.warn(`[AutoChecker] Gemini model "${candidate}" skipped: ${reason}`);
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
+    });
+    if (res.ok) {
+      groqReady = true;
+      console.log('[AutoChecker] Groq ready — model: llama-3.2-11b-vision-preview (FREE)');
+    } else {
+      console.warn(`[AutoChecker] Groq key check failed: HTTP ${res.status}. Check your GROQ_API_KEY.`);
     }
+  } catch (e) {
+    console.warn('[AutoChecker] Groq init error:', e.message);
   }
-
-  console.warn('[AutoChecker] No Gemini model available — all candidates failed. Written types will use Tesseract only.');
 }
 
 // Run probe at startup; does not block server from starting
-initGemini().catch(e => console.warn('[AutoChecker] Gemini init error:', e.message));
+initGroq().catch(e => console.warn('[AutoChecker] Groq init error:', e.message));
 
 // sharp is optional â€” gracefully degrade if not installed
 let sharp;
@@ -1139,22 +1107,22 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
 }
 
 
-// ─── Gemini Vision scanner (identification / enumeration / true_or_false) ────
+// ─── Groq Vision scanner (identification / enumeration / true_or_false) ─────
 //
-// Sends the exam sheet image to Gemini 1.5 Flash with a structured prompt.
-// Gemini reads the handwriting and returns a clean JSON map of answers.
-// Falls back to Tesseract automatically if Gemini is unavailable or fails.
+// Sends the exam sheet image to Groq's free llama-3.2-11b-vision model.
+// Reads handwriting and returns a clean JSON map of answers.
+// Falls back to Tesseract automatically if Groq is unavailable or fails.
 
-async function scanWithGemini(imageBase64, mimeType, examType, questionCount) {
-  if (!geminiModel) {
-    console.warn('[Gemini] Model not available — falling back to Tesseract');
+async function scanWithGroq(imageBase64, mimeType, examType, questionCount) {
+  if (!groqReady) {
+    console.warn('[Groq] Not available — falling back to Tesseract');
     return null;
   }
 
   const typeInstructions = {
-    true_or_false: 'Each answer is either "True" or "False" (or "T"/"F"). Return the exact word the student wrote. If blank, use empty string "".',
+    true_or_false:  'Each answer is either "True" or "False" (or "T"/"F"). Return the exact word the student wrote. If blank, use empty string "".',
     identification: 'Each answer is a handwritten word or short phrase. Copy it exactly as written. If blank, use empty string "".',
-    enumeration: 'Each answer is a handwritten word or short phrase (one item per question number). Copy it exactly as written. If blank, use empty string "".',
+    enumeration:    'Each answer is a handwritten word or short phrase (one item per question number). Copy it exactly as written. If blank, use empty string "".',
   };
 
   const instructions = typeInstructions[examType] ?? typeInstructions.identification;
@@ -1174,20 +1142,40 @@ Always include all numbers from 1 to ${questionCount}.
 If you can see a student name written at the top, also add "studentName" to the JSON.`;
 
   try {
-    console.log(`[Gemini] Scanning ${examType} sheet — ${questionCount} questions`);
+    console.log(`[Groq] Scanning ${examType} sheet — ${questionCount} questions`);
 
-    const result = await geminiModel.generateContent([
-      { text: prompt },
-      { inlineData: { mimeType: mimeType || 'image/jpeg', data: imageBase64 } },
-    ]);
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method:  'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({
+        model:      'llama-3.2-11b-vision-preview',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text',      text: prompt },
+            { type: 'image_url', image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${imageBase64}` } },
+          ],
+        }],
+      }),
+    });
 
-    const rawText = result.response.text().trim();
-    console.log(`[Gemini] Raw response preview: ${rawText.slice(0, 200)}`);
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Groq API error ${response.status}: ${errText.slice(0, 100)}`);
+    }
+
+    const data    = await response.json();
+    const rawText = data.choices?.[0]?.message?.content?.trim() ?? '';
+    console.log(`[Groq] Raw response preview: ${rawText.slice(0, 200)}`);
 
     const jsonText = rawText
       .replace(/^```json\s*/i, '')
-      .replace(/^```\s*/i, '')
-      .replace(/\s*```$/, '')
+      .replace(/^```\s*/i,    '')
+      .replace(/\s*```$/,      '')
       .trim();
 
     let parsed;
@@ -1198,7 +1186,7 @@ If you can see a student name written at the top, also add "studentName" to the 
       if (jsonMatch) {
         parsed = JSON.parse(jsonMatch[0]);
       } else {
-        throw new Error('Could not parse Gemini JSON response: ' + rawText.slice(0, 100));
+        throw new Error('Could not parse Groq JSON response: ' + rawText.slice(0, 100));
       }
     }
 
@@ -1214,18 +1202,18 @@ If you can see a student name written at the top, also add "studentName" to the 
     const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
     const confidence    = Math.min(0.82 + fillRate * 0.15, 0.97);
 
-    console.log(`[Gemini] Done — answered: ${answeredCount}/${questionCount}, confidence: ${(confidence * 100).toFixed(1)}%`);
+    console.log(`[Groq] Done — answered: ${answeredCount}/${questionCount}, confidence: ${(confidence * 100).toFixed(1)}%`);
     return { studentName, answers, answeredCount, engineConfidence: confidence * 100, confidence };
 
   } catch (err) {
-    console.error('[Gemini] Scan failed:', err.message);
+    console.error('[Groq] Scan failed:', err.message);
     return null;
   }
 }
 
 // ─── Full OCR pipeline ────────────────────────────────────────────────────────
 //
-// ARCHITECTURE FIX — OCR-first, Gemini-optional pipeline:
+// ARCHITECTURE FIX — OCR-first, Groq-optional pipeline:
 //
 //   OLD (broken):  Gemini → [fail] → Tesseract fallback
 //     Problem: Gemini was a REQUIRED step. A 404 from an invalid model name
@@ -1235,13 +1223,13 @@ If you can see a student name written at the top, also add "studentName" to the 
 //   NEW (correct): Tesseract (always) → Gemini enhancement (optional, if key set)
 //     1. Tesseract always runs — it is the primary, authoritative OCR engine.
 //     2. Gemini only runs afterward as a post-processor IF:
-//        a. GEMINI_API_KEY is set in the environment, AND
-//        b. geminiModel was initialised successfully, AND
+//        a. GROQ_API_KEY is set in the environment, AND
+//        b. groqReady is true (key valid + probe succeeded), AND
 //        c. Tesseract fill-rate is below the GEMINI_ASSIST_THRESHOLD
 //           (meaning Tesseract found fewer answers than expected — Gemini can help)
 //     3. When Gemini runs, it only fills answers that Tesseract left BLANK.
 //        It never overwrites a Tesseract-detected answer with a Gemini guess.
-//     4. If Gemini fails (network error, quota, wrong key) the Tesseract result
+//     4. If Groq fails (network error, quota, wrong key) the Tesseract result
 //        is returned unchanged — the scan still succeeds.
 //
 // Routing:
@@ -1250,7 +1238,7 @@ If you can see a student name written at the top, also add "studentName" to the 
 
 // Threshold: if Tesseract answered at least this fraction of questions, skip Gemini.
 // At 70%+ fill-rate the OCR result is already solid — no need to pay Gemini latency.
-const GEMINI_ASSIST_THRESHOLD = 0.70;
+const GROQ_ASSIST_THRESHOLD = 0.70;
 
 async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
   const isBubble  = examType === 'bubble_mc' || examType === 'bubble_omr' || examType === 'omr';
@@ -1303,42 +1291,42 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
   console.log(`[AutoChecker] Tesseract parsed — answered: ${tesseractAnsweredCount}/${questionCount}, engine: ${engineConfidence?.toFixed?.(1) ?? 'n/a'}%, fillRate: ${(fillRate * 100).toFixed(1)}%`);
 
   // ── STEP 2: Gemini enhancement (optional, written types only) ───────────
-  // Gemini only activates when:
+  // Groq only activates when:
   //   • exam type is written (not MC / bubble)
-  //   • geminiModel is available (API key set + init succeeded)
+  //   • groqReady is true (API key set + init succeeded)
   //   • Tesseract fill-rate is below threshold (OCR left too many blanks)
   //
-  // When active, Gemini only fills blank slots — never overwrites OCR answers.
-  if (isWritten && geminiModel && fillRate < GEMINI_ASSIST_THRESHOLD) {
-    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% < ${GEMINI_ASSIST_THRESHOLD * 100}% — trying Gemini enhancement`);
+  // When active, Groq only fills blank slots — never overwrites OCR answers.
+  if (isWritten && groqReady && fillRate < GROQ_ASSIST_THRESHOLD) {
+    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% < ${GROQ_ASSIST_THRESHOLD * 100}% — trying Groq vision enhancement`);
     try {
-      const geminiResult = await scanWithGemini(imageBase64, mimeType, examType, questionCount);
-      if (geminiResult) {
-        let geminiFilledCount = 0;
+      const groqResult = await scanWithGroq(imageBase64, mimeType, examType, questionCount);
+      if (groqResult) {
+        let groqFilledCount = 0;
         for (let i = 1; i <= questionCount; i++) {
           const key = String(i);
           // Only accept Gemini's answer for slots that Tesseract left blank
-          if (!answers[key] && geminiResult.answers[key]) {
-            answers[key] = geminiResult.answers[key];
-            geminiFilledCount++;
+          if (!answers[key] && groqResult.answers[key]) {
+            answers[key] = groqResult.answers[key];
+            groqFilledCount++;
           }
         }
         // Accept Gemini's student name if Tesseract didn't find one
-        const finalStudentName = studentName ?? geminiResult.studentName ?? null;
+        const finalStudentName = studentName ?? groqResult.studentName ?? null;
         const finalAnsweredCount = Object.values(answers).filter(a => a !== '').length;
-        console.log(`[AutoChecker] Gemini filled ${geminiFilledCount} blank answer(s) — total: ${finalAnsweredCount}/${questionCount}`);
+        console.log(`[AutoChecker] Groq filled ${groqFilledCount} blank answer(s) — total: ${finalAnsweredCount}/${questionCount}`);
 
         const normalizedEng = Math.max((engineConfidence ?? 0), 0) / 100;
         const finalFillRate = questionCount > 0 ? finalAnsweredCount / questionCount : 0;
         const confidence    = Math.min(normalizedEng * 0.6 + finalFillRate * 0.4, 1.0);
         return { studentName: finalStudentName, answers, answeredCount: finalAnsweredCount, engineConfidence, confidence };
       }
-    } catch (geminiErr) {
-      // Gemini failure is non-fatal — Tesseract result stands
-      console.warn('[AutoChecker] Gemini enhancement failed (non-fatal):', geminiErr.message);
+    } catch (groqErr) {
+      // Groq failure is non-fatal — Tesseract result stands
+      console.warn('[AutoChecker] Groq enhancement failed (non-fatal):', groqErr.message);
     }
-  } else if (isWritten && geminiModel) {
-    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% ≥ ${GEMINI_ASSIST_THRESHOLD * 100}% — Gemini enhancement skipped (not needed)`);
+  } else if (isWritten && groqReady) {
+    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% ≥ ${GROQ_ASSIST_THRESHOLD * 100}% — Groq enhancement skipped (not needed)`);
   }
 
   // ── Return Tesseract-only result ─────────────────────────────────────────
@@ -1637,11 +1625,9 @@ app.get('/health', (_req, res) => res.json({
   sharp:  !!sharp,
   ocr:    'tesseract.js',
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
-  gemini: geminiModel
-    ? `enabled (${geminiModelName}) — post-processing enhancer only`
-    : GEMINI_API_KEY ? 'disabled (no model available for this API key)' : 'disabled (GEMINI_API_KEY not set)',
-  pipeline: 'tesseract-primary / gemini-optional-enhancer',
-  version: '2.3-gemini-probe',
+  groq: groqReady ? 'enabled (llama-3.2-11b-vision-preview) — FREE, 14,400/day' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
+  pipeline: 'tesseract-primary / groq-optional-enhancer',
+  version: '2.4-groq',
 }));
 
 // Error handler
@@ -1653,7 +1639,7 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log('[AutoChecker] v2.3 running on http://0.0.0.0:' + PORT);
   console.log('[AutoChecker] OCR: Tesseract.js LSTM (OEM set at worker init) + ' + (sharp ? 'sharp preprocessing enabled' : 'NO sharp -- run: npm install sharp'));
-  console.log('[AutoChecker] Gemini: probing available models...');
+  console.log('[AutoChecker] Groq vision: ' + (groqReady ? 'ready ✓' : GROQ_API_KEY ? 'key set, probe pending...' : 'not configured (add GROQ_API_KEY)'));
   console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
 });
 
@@ -1663,4 +1649,4 @@ setInterval(() => {
     .catch(() => {});
 }, 5 * 60 * 1000);
 
-// redeploy-trigger-20260509-gemini
+// redeploy-trigger-20260509-groq
