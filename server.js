@@ -151,7 +151,8 @@ const VALID_COLORS = new Set(['blue','green','amber','red']);
 
 function resolveType(raw) {
   const s = String(raw ?? 'mc').toLowerCase().replace(/[\s_\-]/g, '');
-  return ({ mc:'mc', multiplechoice:'mc', truefalse:'truefalse', tf:'truefalse',
+  // FIX: added omr/bubbleomr → mc so toBackendExamType('bubble_omr')='omr' resolves correctly
+  return ({ mc:'mc', multiplechoice:'mc', omr:'mc', bubbleomr:'mc', truefalse:'truefalse', tf:'truefalse',
     identification:'identification', id:'identification', enumeration:'enumeration',
     enum:'enumeration', traceerror:'traceError', trace:'traceError', tracetheerror:'traceError',
     shortanswer:'shortAnswer', short:'shortAnswer', sa:'shortAnswer' })[s] ?? 'identification';
@@ -1240,9 +1241,9 @@ If you can see a student name written at the top, also add "studentName" to the 
 // At 70%+ fill-rate the OCR result is already solid — no need to pay Gemini latency.
 const GROQ_ASSIST_THRESHOLD = 0.70;
 
-async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
+async function parseVisionText(imageBase64, mimeType, examType, questionCount, questionTypeMap, mixedMode) {
   const isBubble  = examType === 'bubble_mc' || examType === 'bubble_omr' || examType === 'omr';
-  const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice';
+  const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice' || examType === 'mc';
   const isWritten = !isMcType;
 
   // ── Route bubble_omr to Jimp pixel detector first ───────────────────────
@@ -1256,7 +1257,129 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
     console.log('[AutoChecker] Falling back to Tesseract for bubble sheet...');
   }
 
-  // ── STEP 1: Tesseract (always runs — primary engine) ────────────────────
+  // ── FIX: Mixed-mode path — run both OCR workers and extract per question range ──
+  // When mixedMode=true and questionTypeMap is provided, we run the MC worker
+  // (for A-D answers) AND the text worker (for written answers) in parallel,
+  // then assign results to each question based on its type in the map.
+  const hasMixedMap = mixedMode && questionTypeMap && Object.keys(questionTypeMap).length > 0;
+
+  if (hasMixedMap) {
+    console.log('[AutoChecker] Mixed-mode scan — running dual OCR workers for', Object.keys(questionTypeMap).length, 'questions');
+
+    // Pre-process image once, reuse buffer for both workers
+    const imageBuffer = await preprocessImage(imageBase64, mimeType, 'multiple_choice');
+
+    // Run MC worker and text worker in parallel
+    let mcText = '', textOcrText = '', engineConfidence = 0;
+    try {
+      const [mcOcr, textOcr] = await Promise.all([
+        (async () => {
+          if (workerMCReady) {
+            await workerMC.setParameters({ tessedit_pageseg_mode: 6, preserve_interword_spaces: '1', tessedit_do_invert: '0', tessedit_char_whitelist: CHAR_WHITELIST_MC });
+            const { data } = await workerMC.recognize(imageBuffer);
+            process.stdout.write('\n');
+            return { text: data.text ?? '', confidence: data.confidence ?? 0 };
+          }
+          return { text: '', confidence: 0 };
+        })(),
+        (async () => {
+          if (workerTextReady) {
+            await workerText.setParameters({ tessedit_pageseg_mode: 6, preserve_interword_spaces: '1', tessedit_do_invert: '0', tessedit_char_whitelist: CHAR_WHITELIST_TEXT });
+            const { data } = await workerText.recognize(imageBuffer);
+            process.stdout.write('\n');
+            return { text: data.text ?? '', confidence: data.confidence ?? 0 };
+          }
+          return { text: '', confidence: 0 };
+        })(),
+      ]);
+      mcText       = fixOcrSubstitutions(mcOcr.text);
+      textOcrText  = fixOcrSubstitutions(textOcr.text);
+      engineConfidence = Math.max(mcOcr.confidence, textOcr.confidence);
+    } catch (err) {
+      console.warn('[AutoChecker] Dual-worker OCR failed, falling back to single pass:', err.message);
+      // Fall through to single-pass Tesseract below
+    }
+
+    const studentName = extractStudentName(mcText) ?? extractStudentName(textOcrText) ?? null;
+    const answers     = {};
+
+    // Categorise questions by their backend type
+    const mcQuestions      = [];
+    const writtenQuestions = {}; // backendType → [qNums]
+
+    for (const [qStr, backendType] of Object.entries(questionTypeMap)) {
+      const q = parseInt(qStr, 10);
+      if (isNaN(q) || q < 1) continue;
+      const isMcQ = backendType === 'mc' || backendType === 'omr' || backendType === 'bubble_omr';
+      if (isMcQ) {
+        mcQuestions.push(q);
+      } else {
+        if (!writtenQuestions[backendType]) writtenQuestions[backendType] = [];
+        writtenQuestions[backendType].push(q);
+      }
+    }
+
+    // Extract MC answers from the MC OCR pass
+    if (mcQuestions.length > 0 && mcText) {
+      const allMcAnswers = extractMcAnswers(mcText, questionCount);
+      for (const q of mcQuestions) {
+        if (allMcAnswers[String(q)]) answers[String(q)] = allMcAnswers[String(q)];
+      }
+      console.log(`[AutoChecker] Mixed MC extraction — found ${Object.keys(answers).length}/${mcQuestions.length} MC answers`);
+    }
+
+    // Extract written answers from the text OCR pass, per type
+    const writtenTypes = Object.keys(writtenQuestions);
+    if (writtenTypes.length > 0 && textOcrText) {
+      for (const backendType of writtenTypes) {
+        const qNums      = writtenQuestions[backendType];
+        const allWritten = extractWrittenAnswers(textOcrText, questionCount, backendType);
+        let filled = 0;
+        for (const q of qNums) {
+          if (allWritten[String(q)]) { answers[String(q)] = allWritten[String(q)]; filled++; }
+        }
+        console.log(`[AutoChecker] Mixed written extraction (${backendType}) — ${filled}/${qNums.length} answers`);
+      }
+    }
+
+    // Fill all blank slots
+    for (let i = 1; i <= questionCount; i++) {
+      if (!answers[String(i)]) answers[String(i)] = '';
+    }
+
+    const answeredCount = Object.values(answers).filter(a => a !== '').length;
+    const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
+
+    // Try Groq for any written blanks if fill-rate is low
+    if (groqReady && fillRate < GROQ_ASSIST_THRESHOLD && writtenTypes.length > 0) {
+      // Run Groq for each written type separately so it gets the right prompt
+      for (const backendType of writtenTypes) {
+        const groqExamType = backendType === 'truefalse' ? 'true_or_false' : backendType;
+        const blankQs = writtenQuestions[backendType].filter(q => !answers[String(q)]);
+        if (blankQs.length === 0) continue;
+        console.log(`[AutoChecker] Mixed Groq fill — ${blankQs.length} blanks for ${backendType}`);
+        try {
+          const groqResult = await scanWithGroq(imageBase64, mimeType, groqExamType, questionCount);
+          if (groqResult) {
+            for (const q of blankQs) {
+              const k = String(q);
+              if (!answers[k] && groqResult.answers[k]) { answers[k] = groqResult.answers[k]; }
+            }
+          }
+        } catch (groqErr) {
+          console.warn('[AutoChecker] Mixed Groq fill failed (non-fatal):', groqErr.message);
+        }
+      }
+    }
+
+    const finalAnsweredCount = Object.values(answers).filter(a => a !== '').length;
+    const finalFillRate      = questionCount > 0 ? finalAnsweredCount / questionCount : 0;
+    const confidence         = Math.min((engineConfidence / 100) * 0.6 + finalFillRate * 0.4, 1.0);
+    console.log(`[AutoChecker] Mixed-mode final — answered: ${finalAnsweredCount}/${questionCount}, confidence: ${(confidence * 100).toFixed(1)}%`);
+    return { studentName, answers, answeredCount: finalAnsweredCount, engineConfidence, confidence };
+  }
+
+  // ── STEP 1: Tesseract (always runs — primary engine for single-type exams) ──
   const { text: rawText, engineConfidence } =
     await runTesseract(imageBase64, mimeType, examType);
 
@@ -1290,13 +1413,7 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
 
   console.log(`[AutoChecker] Tesseract parsed — answered: ${tesseractAnsweredCount}/${questionCount}, engine: ${engineConfidence?.toFixed?.(1) ?? 'n/a'}%, fillRate: ${(fillRate * 100).toFixed(1)}%`);
 
-  // ── STEP 2: Gemini enhancement (optional, written types only) ───────────
-  // Groq only activates when:
-  //   • exam type is written (not MC / bubble)
-  //   • groqReady is true (API key set + init succeeded)
-  //   • Tesseract fill-rate is below threshold (OCR left too many blanks)
-  //
-  // When active, Groq only fills blank slots — never overwrites OCR answers.
+  // ── STEP 2: Groq enhancement (optional, written types only) ─────────────
   if (isWritten && groqReady && fillRate < GROQ_ASSIST_THRESHOLD) {
     console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% < ${GROQ_ASSIST_THRESHOLD * 100}% — trying Groq vision enhancement`);
     try {
@@ -1305,14 +1422,12 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
         let groqFilledCount = 0;
         for (let i = 1; i <= questionCount; i++) {
           const key = String(i);
-          // Only accept Gemini's answer for slots that Tesseract left blank
           if (!answers[key] && groqResult.answers[key]) {
             answers[key] = groqResult.answers[key];
             groqFilledCount++;
           }
         }
-        // Accept Gemini's student name if Tesseract didn't find one
-        const finalStudentName = studentName ?? groqResult.studentName ?? null;
+        const finalStudentName   = studentName ?? groqResult.studentName ?? null;
         const finalAnsweredCount = Object.values(answers).filter(a => a !== '').length;
         console.log(`[AutoChecker] Groq filled ${groqFilledCount} blank answer(s) — total: ${finalAnsweredCount}/${questionCount}`);
 
@@ -1322,11 +1437,10 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount) {
         return { studentName: finalStudentName, answers, answeredCount: finalAnsweredCount, engineConfidence, confidence };
       }
     } catch (groqErr) {
-      // Groq failure is non-fatal — Tesseract result stands
       console.warn('[AutoChecker] Groq enhancement failed (non-fatal):', groqErr.message);
     }
   } else if (isWritten && groqReady) {
-    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% ≥ ${GROQ_ASSIST_THRESHOLD * 100}% — Groq enhancement skipped (not needed)`);
+    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% >= ${GROQ_ASSIST_THRESHOLD * 100}% — Groq enhancement skipped (not needed)`);
   }
 
   // ── Return Tesseract-only result ─────────────────────────────────────────
@@ -1523,7 +1637,8 @@ app.post('/api/score/:sectionId', (req, res) => {
 //             â†’ client never crashes on a bad scan
 
 app.post('/api/scan', async (req, res) => {
-  const { imageBase64, mimeType, examType, sectionId, questionCount } = req.body;
+  const { imageBase64, mimeType, examType, sectionId, questionCount,
+          questionTypeMap, mixedMode } = req.body; // FIX: extract mixed-mode fields
   if (!imageBase64) return res.status(400).json({ success: false, error: 'imageBase64 is required.' });
   if (!examType)    return res.status(400).json({ success: false, error: 'examType is required.' });
 
@@ -1535,7 +1650,8 @@ app.post('/api/scan', async (req, res) => {
     console.log(`[AutoChecker] Scanning â€” examType=${examType}, questions=${totalQs}`);
 
     const { studentName, answers, answeredCount, engineConfidence, confidence } =
-      await parseVisionText(imageBase64, mimeType || 'image/jpeg', examType, totalQs);
+      await parseVisionText(imageBase64, mimeType || 'image/jpeg', examType, totalQs,
+        questionTypeMap, mixedMode); // FIX: pass mixed-mode fields through
 
     let notes = '';
     if (confidence < 0.3) {
