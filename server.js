@@ -1152,23 +1152,31 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
 // Reads handwriting and returns a clean JSON map of answers.
 // Falls back to Tesseract automatically if Groq is unavailable or fails.
 
-async function scanWithGroq(imageBase64, mimeType, examType, questionCount) {
+// fromQ / toQ: optional question range for mixed-mode scans.
+// When provided, Groq is told to ONLY read questions in that range,
+// preventing it from returning MC letters in T/F slots, etc.
+async function scanWithGroq(imageBase64, mimeType, examType, questionCount, fromQ = null, toQ = null) {
   if (!groqReady) {
     console.warn('[Groq] Not available — falling back to Tesseract');
     return null;
   }
 
+  // Use the range if provided, otherwise scan all questions
+  const qFrom = fromQ ?? 1;
+  const qTo   = toQ   ?? questionCount;
+  const rangeDesc = (fromQ && toQ) ? `questions ${qFrom} to ${qTo}` : `all ${questionCount} questions`;
+
   const typeInstructions = {
-    true_or_false:  'Each answer is either "True" or "False" (or "T"/"F"). Return the exact word the student wrote. If blank, use empty string "".',
-    identification: 'Each answer is a handwritten word or short phrase. Copy it exactly as written. If blank, use empty string "".',
-    enumeration:    'Each answer is a handwritten word or short phrase (one item per question number). Copy it exactly as written. If blank, use empty string "".',
+    true_or_false:  'Each answer is either "True" or "False". Look for T, F, True, or False written by the student. If blank, use empty string "".',
+    identification: 'Each answer is a handwritten word or short phrase. Copy the student\'s intent (not garbled strokes). If blank, use empty string "".',
+    enumeration:    'Each answer is a handwritten word or short phrase (one item per question number). Copy the student\'s intent. If blank, use empty string "".',
   };
 
   const instructions = typeInstructions[examType] ?? typeInstructions.identification;
 
   const prompt = `You are an expert at reading messy student handwriting on Filipino school exam papers.
 Exam type: ${examType}
-Number of questions: ${questionCount}
+Your job: read ONLY ${rangeDesc} (numbered ${qFrom} to ${qTo}).
 
 ${instructions}
 
@@ -1181,19 +1189,18 @@ IMPORTANT — the handwriting may be messy, hasty, rushed, or hard to read. Appl
     "g" written as "9" or "q"         letters merged together
 - If a word is ambiguous, choose the spelling that makes sense as a school answer.
 - Do NOT copy garbled strokes literally — copy the student's INTENT.
-- For identification: return the word or phrase the student was trying to write.
 - For true/false: return "True" or "False" — even if only T or F is visible.
+- IGNORE questions outside the range ${qFrom}–${qTo}. Do not include them.
 
-Look at every numbered answer box or blank on the sheet (1 to ${questionCount}).
-Return ONLY a valid JSON object — no explanation, no markdown, no extra text:
-{"1":"answer","2":"answer","3":"answer"}
+Return ONLY a valid JSON object — no explanation, no markdown, no extra text.
+Include ONLY question numbers ${qFrom} through ${qTo}:
+{"${qFrom}":"answer","${qFrom+1}":"answer",...,"${qTo}":"answer"}
 
-If a question has no visible answer, use an empty string "" for that number.
-Always include all numbers from 1 to ${questionCount}.
+If a question in the range has no visible answer, use empty string "".
 If you can see a student name written at the top, also add "studentName" to the JSON.`;
 
   try {
-    console.log(`[Groq] Scanning ${examType} sheet — ${questionCount} questions`);
+    console.log(`[Groq] Scanning ${examType} — ${rangeDesc}`);
 
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method:  'POST',
@@ -1244,16 +1251,18 @@ If you can see a student name written at the top, also add "studentName" to the 
     const studentName = parsed.studentName ?? null;
     delete parsed.studentName;
 
+    // Only extract answers within the requested range (qFrom–qTo)
     const answers = {};
-    for (let i = 1; i <= questionCount; i++) {
+    for (let i = qFrom; i <= qTo; i++) {
       answers[String(i)] = (parsed[String(i)] ?? parsed[i] ?? '').trim();
     }
 
+    const rangeSize     = qTo - qFrom + 1;
     const answeredCount = Object.values(answers).filter(a => a !== '').length;
-    const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
+    const fillRate      = rangeSize > 0 ? answeredCount / rangeSize : 0;
     const confidence    = Math.min(0.82 + fillRate * 0.15, 0.97);
 
-    console.log(`[Groq] Done — answered: ${answeredCount}/${questionCount}, confidence: ${(confidence * 100).toFixed(1)}%`);
+    console.log(`[Groq] Done — answered: ${answeredCount}/${rangeSize} (Q${qFrom}-Q${qTo}), confidence: ${(confidence * 100).toFixed(1)}%`);
     return { studentName, answers, answeredCount, engineConfidence: confidence * 100, confidence };
 
   } catch (err) {
@@ -1405,14 +1414,21 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
 
     // Try Groq for any written blanks if fill-rate is low
     if (groqReady && fillRate < GROQ_ASSIST_THRESHOLD && writtenTypes.length > 0) {
-      // Run Groq for each written type separately so it gets the right prompt
+      // Run Groq for each written type separately with its exact question range
       for (const backendType of writtenTypes) {
         const groqExamType = backendType === 'truefalse' ? 'true_or_false' : backendType;
         const blankQs = writtenQuestions[backendType].filter(q => !answers[String(q)]);
         if (blankQs.length === 0) continue;
-        console.log(`[AutoChecker] Mixed Groq fill — ${blankQs.length} blanks for ${backendType}`);
+
+        // Calculate the min/max question numbers for this type's range
+        const allQsForType = writtenQuestions[backendType];
+        const fromQ = Math.min(...allQsForType);
+        const toQ   = Math.max(...allQsForType);
+
+        console.log(`[AutoChecker] Mixed Groq fill — ${blankQs.length} blanks for ${backendType} (Q${fromQ}-Q${toQ})`);
         try {
-          const groqResult = await scanWithGroq(imageBase64, mimeType, groqExamType, questionCount);
+          // Pass fromQ/toQ so Groq only reads the correct section of the paper
+          const groqResult = await scanWithGroq(imageBase64, mimeType, groqExamType, questionCount, fromQ, toQ);
           if (groqResult) {
             for (const q of blankQs) {
               const k = String(q);
