@@ -65,7 +65,7 @@ async function initGroq() {
     });
     if (res.ok) {
       groqReady = true;
-      console.log('[AutoChecker] Groq ready — model: llama-3.2-11b-vision-preview (FREE)');
+      console.log('[AutoChecker] Groq ready — model: llama-4-scout-17b-16e-instruct (FREE)');
     } else {
       console.warn(`[AutoChecker] Groq key check failed: HTTP ${res.status}. Check your GROQ_API_KEY.`);
     }
@@ -1148,7 +1148,7 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
 
 // ─── Groq Vision scanner (identification / enumeration / true_or_false) ─────
 //
-// Sends the exam sheet image to Groq's free llama-3.2-11b-vision model.
+// Sends the exam sheet image to Groq's llama-4-scout-17b-16e-instruct model.
 // Reads handwriting and returns a clean JSON map of answers.
 // Falls back to Tesseract automatically if Groq is unavailable or fails.
 
@@ -1202,7 +1202,7 @@ If you can see a student name written at the top, also add "studentName" to the 
         'Content-Type':  'application/json',
       },
       body: JSON.stringify({
-        model:      'llama-3.2-11b-vision-preview',
+        model:      'meta-llama/llama-4-scout-17b-16e-instruct',
         max_tokens: 1000,
         messages: [{
           role: 'user',
@@ -1433,7 +1433,7 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   }
 
   // ── v3.0: Written types → Groq FIRST (much better at messy handwriting) ───
-  // Groq (llama-3.2-11b-vision) is a real vision model that understands
+  // Groq (llama-4-scout-17b-16e-instruct) is a real vision model that understands
   // handwriting context. Tesseract is a character recognizer — it reads pixel
   // shapes without understanding words, so messy writing defeats it.
   // We now send written-type sheets to Groq first and only fall back to
@@ -1814,7 +1814,7 @@ app.get('/health', (_req, res) => res.json({
   sharp:  !!sharp,
   ocr:    'tesseract.js',
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
-  groq: groqReady ? 'enabled (llama-3.2-11b-vision-preview) — FREE, 14,400/day' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
+  groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
   version: '3.0-groq-primary',
 }));
