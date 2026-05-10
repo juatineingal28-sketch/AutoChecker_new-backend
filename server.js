@@ -559,15 +559,50 @@ async function parseUploadedFile(filePath, ext) {
 
 // â”€â”€â”€ Scoring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+// ─── Levenshtein distance helper (for fuzzy matching) ────────────────────────
+//
+// v3.0 NEW: Allows small spelling errors caused by messy handwriting OCR.
+// "photosintesis" → matches "photosynthesis" (2-char distance)
+// "rosess"        → matches "roses"           (1-char distance)
+// MC and True/False are NOT fuzzy — A must equal A, True must equal True.
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+// Fuzzy match: allow 1 typo for short answers (≤6 chars), 2 for longer ones.
+// This handles OCR errors like "photosintesis" vs "photosynthesis".
+function fuzzyMatch(studentRaw, correctAnswer) {
+  const a = String(studentRaw).trim().toLowerCase();
+  const b = String(correctAnswer).trim().toLowerCase();
+  if (a === b) return true;
+  // Don't fuzzy-match very short strings (1-2 chars) — too many false positives
+  if (a.length < 3 || b.length < 3) return false;
+  const maxDist = b.length <= 6 ? 1 : 2;
+  return levenshtein(a, b) <= maxDist;
+}
+
 function checkAnswer(keyItem, studentRaw) {
   if (keyItem.type === 'mc')          return String(studentRaw).trim().toUpperCase() === keyItem.answer;
   if (keyItem.type === 'truefalse')   return String(studentRaw).trim().toUpperCase() === String(keyItem.answer).toUpperCase();
   if (keyItem.type === 'enumeration') {
     if (!Array.isArray(keyItem.answer)) return false;
     const si = String(studentRaw).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-    return keyItem.answer.every(r => si.includes(r));
+    // v3.0: fuzzy match each required item against student's answer list
+    return keyItem.answer.every(req => si.some(s => fuzzyMatch(s, req)));
   }
-  return String(studentRaw).trim().toLowerCase() === String(keyItem.answer).trim().toLowerCase();
+  // identification / shortAnswer / traceError → fuzzy match
+  return fuzzyMatch(studentRaw, keyItem.answer);
 }
 
 function typeSummary(key) {
@@ -610,7 +645,7 @@ async function preprocessImage(base64, mimeType) {
       // BUG FIX: threshold lowered from 175 â†’ 155.
       // 175 was too aggressive â€” it over-binarized ballpen strokes, causing broken
       // characters that Tesseract couldn't recognize. 155 preserves more of the ink.
-      .threshold(155)
+      .threshold(140)
       .resize({
         width:              2000,          // FIX: was accidentally 20px — too small for Tesseract
         fit:                'inside',
@@ -1131,11 +1166,23 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount) {
 
   const instructions = typeInstructions[examType] ?? typeInstructions.identification;
 
-  const prompt = `You are scanning a student exam answer sheet.
+  const prompt = `You are an expert at reading messy student handwriting on Filipino school exam papers.
 Exam type: ${examType}
 Number of questions: ${questionCount}
 
 ${instructions}
+
+IMPORTANT — the handwriting may be messy, hasty, rushed, or hard to read. Apply these rules:
+- Use context clues and the subject matter to interpret unclear letters or words.
+- Common handwriting confusions to watch for:
+    "a" written as "q" or "u"         "n" written as "m" or "ri"
+    "e" written as "c" or "o"         "i" written as "l" or "1"
+    "h" written as "li" or "b"        "s" written as "5" or "z"
+    "g" written as "9" or "q"         letters merged together
+- If a word is ambiguous, choose the spelling that makes sense as a school answer.
+- Do NOT copy garbled strokes literally — copy the student's INTENT.
+- For identification: return the word or phrase the student was trying to write.
+- For true/false: return "True" or "False" — even if only T or F is visible.
 
 Look at every numbered answer box or blank on the sheet (1 to ${questionCount}).
 Return ONLY a valid JSON object — no explanation, no markdown, no extra text:
@@ -1240,8 +1287,11 @@ If you can see a student name written at the top, also add "studentName" to the 
 //   bubble_omr      → Jimp pixel detector → Tesseract fallback
 //   all other types → Tesseract (primary) → Gemini fill-in (optional enhancer)
 
-// Threshold: if Tesseract answered at least this fraction of questions, skip Gemini.
-// At 70%+ fill-rate the OCR result is already solid — no need to pay Gemini latency.
+// v3.0: Groq now runs FIRST for written types (see parseVisionText).
+// This threshold only controls the FALLBACK fill-in pass — if Tesseract also
+// fails as a secondary engine, Groq makes one last attempt to fill blank slots.
+// Kept at 0.70: if Tesseract already found 70%+ answers as fallback, the sheet
+// is readable enough and another Groq call would just add latency.
 const GROQ_ASSIST_THRESHOLD = 0.70;
 
 async function parseVisionText(imageBase64, mimeType, examType, questionCount, questionTypeMap, mixedMode) {
@@ -1382,7 +1432,27 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
     return { studentName, answers, answeredCount: finalAnsweredCount, engineConfidence, confidence };
   }
 
-  // ── STEP 1: Tesseract (always runs — primary engine for single-type exams) ──
+  // ── v3.0: Written types → Groq FIRST (much better at messy handwriting) ───
+  // Groq (llama-3.2-11b-vision) is a real vision model that understands
+  // handwriting context. Tesseract is a character recognizer — it reads pixel
+  // shapes without understanding words, so messy writing defeats it.
+  // We now send written-type sheets to Groq first and only fall back to
+  // Tesseract if Groq is unavailable or returns zero answers.
+  if (isWritten && groqReady) {
+    console.log('[AutoChecker] v3.0 — Written type: trying Groq vision FIRST (primary engine)');
+    try {
+      const groqResult = await scanWithGroq(imageBase64, mimeType, examType, questionCount);
+      if (groqResult && groqResult.answeredCount > 0) {
+        console.log(`[AutoChecker] Groq primary SUCCESS — answered: ${groqResult.answeredCount}/${questionCount} (skipping Tesseract)`);
+        return groqResult;
+      }
+      console.warn('[AutoChecker] Groq returned 0 answers — falling back to Tesseract');
+    } catch (groqErr) {
+      console.warn('[AutoChecker] Groq primary failed, falling back to Tesseract:', groqErr.message);
+    }
+  }
+
+  // ── STEP 1: Tesseract (always runs for MC; fallback for written types) ───
   const { text: rawText, engineConfidence } =
     await runTesseract(imageBase64, mimeType, examType);
 
@@ -1416,9 +1486,11 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
 
   console.log(`[AutoChecker] Tesseract parsed — answered: ${tesseractAnsweredCount}/${questionCount}, engine: ${engineConfidence?.toFixed?.(1) ?? 'n/a'}%, fillRate: ${(fillRate * 100).toFixed(1)}%`);
 
-  // ── STEP 2: Groq enhancement (optional, written types only) ─────────────
+  // ── STEP 2: Groq fill-in for any Tesseract blanks (written types only) ───
+  // At this point Groq already failed or was unavailable as primary engine.
+  // Try it one more time for any questions Tesseract left blank.
   if (isWritten && groqReady && fillRate < GROQ_ASSIST_THRESHOLD) {
-    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% < ${GROQ_ASSIST_THRESHOLD * 100}% — trying Groq vision enhancement`);
+    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% — trying Groq for remaining blanks`);
     try {
       const groqResult = await scanWithGroq(imageBase64, mimeType, examType, questionCount);
       if (groqResult) {
@@ -1432,7 +1504,7 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
         }
         const finalStudentName   = studentName ?? groqResult.studentName ?? null;
         const finalAnsweredCount = Object.values(answers).filter(a => a !== '').length;
-        console.log(`[AutoChecker] Groq filled ${groqFilledCount} blank answer(s) — total: ${finalAnsweredCount}/${questionCount}`);
+        console.log(`[AutoChecker] Groq fallback filled ${groqFilledCount} blank(s) — total: ${finalAnsweredCount}/${questionCount}`);
 
         const normalizedEng = Math.max((engineConfidence ?? 0), 0) / 100;
         const finalFillRate = questionCount > 0 ? finalAnsweredCount / questionCount : 0;
@@ -1440,10 +1512,8 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
         return { studentName: finalStudentName, answers, answeredCount: finalAnsweredCount, engineConfidence, confidence };
       }
     } catch (groqErr) {
-      console.warn('[AutoChecker] Groq enhancement failed (non-fatal):', groqErr.message);
+      console.warn('[AutoChecker] Groq fallback failed (non-fatal):', groqErr.message);
     }
-  } else if (isWritten && groqReady) {
-    console.log(`[AutoChecker] Tesseract fill-rate ${(fillRate * 100).toFixed(1)}% >= ${GROQ_ASSIST_THRESHOLD * 100}% — Groq enhancement skipped (not needed)`);
   }
 
   // ── Return Tesseract-only result ─────────────────────────────────────────
@@ -1746,7 +1816,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-3.2-11b-vision-preview) — FREE, 14,400/day' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '2.4-groq',
+  version: '3.0-groq-primary',
 }));
 
 // Error handler
@@ -1756,7 +1826,7 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('[AutoChecker] v2.3 running on http://0.0.0.0:' + PORT);
+  console.log('[AutoChecker] v3.0 running on http://0.0.0.0:' + PORT);
   console.log('[AutoChecker] OCR: Tesseract.js LSTM (OEM set at worker init) + ' + (sharp ? 'sharp preprocessing enabled' : 'NO sharp -- run: npm install sharp'));
   console.log('[AutoChecker] Groq vision: ' + (groqReady ? 'ready ✓' : GROQ_API_KEY ? 'key set, probe pending...' : 'not configured (add GROQ_API_KEY)'));
   console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
