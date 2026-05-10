@@ -908,10 +908,13 @@ function extractMcAnswers(text, questionCount) {
   const answers = {};
   const maxQ    = Math.max(questionCount * 3, 50);
 
-  // Pattern A: same-line â€” "1. A"  "1) B"  "Q1: C"
-  // BUG FIX: changed \b to (?:\s|[.,;)\n]|$) â€” Tesseract often appends punctuation
-  // or noise after the letter, breaking the word-boundary match on handwritten sheets.
-  const RE_INLINE = /[Qq]?(\d{1,3})\s*[.):\-\/]?\s*([ABCDabcd])(?:\s|[.,;)\n]|$)/g;
+  // Pattern A: same-line "1. B"  "1) B"  "Q1: B"
+  //
+  // FIX: Added negative lookahead (?!\s*[.)\-]\s*[A-Za-z]) after the letter.
+  // Prevents matching printed choice labels like "3. A. HTML" or "4. A. Structure"
+  // where the letter is immediately followed by ". word" (= printed choice format).
+  // A student's handwritten "B" is standalone and does NOT match that pattern.
+  const RE_INLINE = /[Qq]?(\d{1,3})\s*[.):\-\/]?\s*([ABCDabcd])(?!\s*[.)\-]\s*[A-Za-z])(?:\s|[.,;)\n]|$)/g;
   let m;
   while ((m = RE_INLINE.exec(text)) !== null) {
     const q = parseInt(m[1], 10);
@@ -919,10 +922,12 @@ function extractMcAnswers(text, questionCount) {
   }
 
   // Pattern B: number on one line, letter on next
+  // FIX: require the answer line to be a truly standalone letter
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   for (let i = 0; i < lines.length - 1; i++) {
     const numMatch = lines[i].match(/^[Qq]?(\d{1,3})[.):\s]*$/);
-    const ansMatch = lines[i + 1].match(/^[\[(]?([ABCDabcd])[\].)]*$/i);
+    const ansLine  = lines[i + 1];
+    const ansMatch = ansLine.match(/^[\[(]?([ABCDabcd])[\].]?\s*$/i);
     if (numMatch && ansMatch) {
       const q = parseInt(numMatch[1], 10);
       if (q >= 1 && q <= maxQ && !answers[String(q)]) {
@@ -931,12 +936,14 @@ function extractMcAnswers(text, questionCount) {
     }
   }
 
-  // Pattern C: compact grid â€” "1A 2B 3C"
-  const RE_GRID = /(\d{1,3})[.\-]?\s*([ABCDabcd])(?=\s|\d|$)/g;
-  while ((m = RE_GRID.exec(text)) !== null) {
-    const q = parseInt(m[1], 10);
-    if (q >= 1 && q <= maxQ && !answers[String(q)]) {
-      answers[String(q)] = m[2].toUpperCase();
+  // Pattern C: compact grid "1B 2C 3A" — only when A/B found very few results
+  if (Object.keys(answers).length < Math.floor(questionCount * 0.3)) {
+    const RE_GRID = /(\d{1,3})[.\-]?\s*([ABCDabcd])(?=\s|\d|$)/g;
+    while ((m = RE_GRID.exec(text)) !== null) {
+      const q = parseInt(m[1], 10);
+      if (q >= 1 && q <= maxQ && !answers[String(q)]) {
+        answers[String(q)] = m[2].toUpperCase();
+      }
     }
   }
 
@@ -958,40 +965,71 @@ function extractMcAnswers(text, questionCount) {
 //   3. Normalise: lowercase for identification, preserve case for short_answer
 //   4. Tolerant: accepts answers with OCR noise (extra dots, dashes, smeared chars)
 
+// Patterns that indicate the captured text is printed question text, not a student answer
+const MAX_ANSWER_LENGTH = 50;
+const QUESTION_TEXT_PATTERNS = /\b(is used to|stands for|which of|refers to|the following|it is|used for|describes|that is|a system that|a format used|connects|manages|a javascript|library for)\b/i;
+
+// When OCR merges a student's short answer with the printed question text on one line,
+// extract just the first meaningful token (the student's answer).
+// Example: "CSS It is used to style web pages." → "CSS"
+function firstWordIfTooLong(raw) {
+  const trimmed = raw.trim();
+  if (trimmed.length <= MAX_ANSWER_LENGTH) return trimmed;
+  const sentenceSplit = trimmed.match(/^([A-Za-z0-9._\-]{1,30})\s+[A-Z]/);
+  if (sentenceSplit) {
+    const candidate = sentenceSplit[1].trim();
+    if (candidate.length >= 1 && candidate.length <= MAX_ANSWER_LENGTH) return candidate;
+  }
+  return trimmed.slice(0, MAX_ANSWER_LENGTH).trim();
+}
+
 function extractWrittenAnswers(text, questionCount, examType) {
   const answers = {};
   const maxQ    = Math.max(questionCount + 5, 20);
 
-  // â”€â”€ Strategy 1: numbered lines â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Matches: "1. word(s)"  "2) phrase"  "3: text"
+  // Strategy 1: numbered lines
   const RE_NUMBERED = /^[Qq]?(\d{1,3})\s*[.):\-\/]?\s*(.{1,120})$/gm;
   let m;
   while ((m = RE_NUMBERED.exec(text)) !== null) {
     const q = parseInt(m[1], 10);
-    const v = m[2].trim();
-    // Skip lines that look like question text (too long) or are purely numeric
-    if (q >= 1 && q <= maxQ && v.length >= 1 && !/^\d+$/.test(v)) {
-      if (!answers[String(q)]) {
-        answers[String(q)] = normaliseWritten(v, examType);
-      }
+    let v   = m[2].trim();
+
+    if (q < 1 || q > maxQ)         continue;
+    if (!v || /^\d+$/.test(v))      continue;
+
+    // FIX: skip lines that look like printed question text
+    if (QUESTION_TEXT_PATTERNS.test(v)) continue;
+
+    // FIX: if too long, try to extract just the answer portion
+    if (v.length > MAX_ANSWER_LENGTH) {
+      v = firstWordIfTooLong(v);
+      if (QUESTION_TEXT_PATTERNS.test(v)) continue;
+    }
+
+    if (!answers[String(q)]) {
+      answers[String(q)] = normaliseWritten(v, examType);
     }
   }
 
-  // â”€â”€ Strategy 2: number + answer on consecutive lines â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // Strategy 2: number + answer on consecutive lines
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   for (let i = 0; i < lines.length - 1; i++) {
     const numMatch = lines[i].match(/^[Qq]?(\d{1,3})[.):\s]*$/);
-    if (numMatch) {
-      const q        = parseInt(numMatch[1], 10);
-      const nextLine = lines[i + 1];
-      // Accept if next line is not another number
-      if (q >= 1 && q <= maxQ && !answers[String(q)] && !/^\d+[.):]\s/.test(nextLine)) {
-        const cleaned = nextLine.replace(/^[-â€“â€”â€¢]\s*/, '').trim();
-        if (cleaned.length >= 1) {
-          answers[String(q)] = normaliseWritten(cleaned, examType);
-        }
-      }
-    }
+    if (!numMatch) continue;
+
+    const q        = parseInt(numMatch[1], 10);
+    const nextLine = lines[i + 1];
+
+    if (q < 1 || q > maxQ)                          continue;
+    if (answers[String(q)])                          continue;
+    if (/^\d+[.):]\s/.test(nextLine))               continue;
+
+    const cleaned = nextLine.replace(/^[-\u2013\u2014\u2022]\s*/, '').trim();
+    if (!cleaned)                                    continue;
+    if (QUESTION_TEXT_PATTERNS.test(cleaned))        continue;
+    if (cleaned.length > MAX_ANSWER_LENGTH)          continue;
+
+    answers[String(q)] = normaliseWritten(cleaned, examType);
   }
 
   return answers;
@@ -1161,43 +1199,89 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
     return null;
   }
 
-  // Use the range if provided, otherwise scan all questions
   const qFrom = fromQ ?? 1;
   const qTo   = toQ   ?? questionCount;
   const rangeDesc = (fromQ && toQ) ? `questions ${qFrom} to ${qTo}` : `all ${questionCount} questions`;
 
+  // Per-type instructions — explicitly distinguish printed text from handwritten answers.
+  // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
-    true_or_false:  'Each answer is either "True" or "False". Look for T, F, True, or False written by the student. If blank, use empty string "".',
-    identification: 'Each answer is a handwritten word or short phrase. Copy the student\'s intent (not garbled strokes). If blank, use empty string "".',
-    enumeration:    'Each answer is a handwritten word or short phrase (one item per question number). Copy the student\'s intent. If blank, use empty string "".',
+
+    multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
+
+CRITICAL — THE PAPER HAS TWO KINDS OF TEXT:
+1. PRINTED CHOICES (pre-printed, IGNORE these): e.g. "A. CSS   B. HTML   C. Python   D. Java"
+   These are the answer options. Do NOT return these letters.
+2. HANDWRITTEN ANSWER (read this): a single letter the student wrote in pen,
+   usually on a blank line before or after the question number.
+
+HOW TO FIND THE STUDENT'S ANSWER:
+- Look for a lone handwritten letter (A, B, C, or D) near the question number.
+- It may appear on a blank underline before the question: "___1. Which..."
+- It may appear on a line after the question number.
+- It is handwritten — uneven, slightly slanted, imperfect strokes.
+- If blank (student did not answer), use "".
+
+Return ONLY the single uppercase letter: "A", "B", "C", or "D".
+Do NOT return letters from the printed choices. Do NOT return the question text.`,
+
+    true_or_false: `Each answer is either "True" or "False" handwritten by the student.
+
+CRITICAL — THE PAPER HAS TWO KINDS OF TEXT:
+1. PRINTED TEXT (pre-printed, IGNORE): "TRUE OR FALSE", instructions, question text.
+2. HANDWRITTEN ANSWER (read this): the student wrote T, F, True, or False
+   near the question number or on a blank line.
+
+Look for handwritten T/F near each question number.
+Return "True" or "False". If blank, use "".`,
+
+    identification: `Each answer is a handwritten word or short phrase (1-5 words) on a blank line.
+
+CRITICAL — THE PAPER HAS TWO KINDS OF TEXT:
+1. PRINTED QUESTION TEXT (pre-printed, IGNORE): the question description after the blank.
+   Example: "It is used to style web pages." — this is printed, NOT the answer.
+2. HANDWRITTEN ANSWER (read this): the student's written word/phrase on the blank line (___).
+
+The blank may appear:
+ - BEFORE the question number: "_______ 9. Git is a version control system."
+ - AFTER the question number: "9. _______ Git is a version control system."
+ - OR directly after the number before the question text.
+
+Read ONLY what is written on the blank line. Do NOT return the printed question text.
+If blank, use "".`,
+
+    enumeration: `Each answer is a handwritten word or short phrase on a numbered blank line.
+
+CRITICAL — THE PAPER HAS TWO KINDS OF TEXT:
+1. PRINTED CATEGORY LABELS (pre-printed, IGNORE): e.g. "Frontend technologies:", "Database systems:"
+2. HANDWRITTEN ANSWER (read this): the student's word/phrase written on the blank line.
+
+Do NOT return printed category headings or printed examples. If blank, use "".`,
   };
 
   const instructions = typeInstructions[examType] ?? typeInstructions.identification;
 
-  const prompt = `You are an expert at reading messy student handwriting on Filipino school exam papers.
-Exam type: ${examType}
-Your job: read ONLY ${rangeDesc} (numbered ${qFrom} to ${qTo}).
+  const prompt = `You are an expert at reading Filipino school exam papers with handwritten student answers.
+
+EXAM TYPE: ${examType}
+YOUR JOB: Read ONLY ${rangeDesc} (numbered ${qFrom} to ${qTo}).
 
 ${instructions}
 
-IMPORTANT — the handwriting may be messy, hasty, rushed, or hard to read. Apply these rules:
-- Use context clues and the subject matter to interpret unclear letters or words.
-- Common handwriting confusions to watch for:
-    "a" written as "q" or "u"         "n" written as "m" or "ri"
-    "e" written as "c" or "o"         "i" written as "l" or "1"
-    "h" written as "li" or "b"        "s" written as "5" or "z"
-    "g" written as "9" or "q"         letters merged together
-- If a word is ambiguous, choose the spelling that makes sense as a school answer.
-- Do NOT copy garbled strokes literally — copy the student's INTENT.
-- For true/false: return "True" or "False" — even if only T or F is visible.
-- IGNORE questions outside the range ${qFrom}–${qTo}. Do not include them.
+HANDWRITING TIPS — common messy handwriting patterns:
+  "a" written as "q" or "u"    |  "n" written as "m" or "ri"
+  "e" written as "c" or "o"    |  "i" written as "l" or "1"
+  "h" written as "li" or "b"   |  "s" written as "5" or "z"
+  "g" written as "9" or "q"    |  letters merged together
+Use context (exam subject, nearby words) to correct ambiguous letters.
+Copy the student's INTENT, not garbled strokes.
 
-Return ONLY a valid JSON object — no explanation, no markdown, no extra text.
-Include ONLY question numbers ${qFrom} through ${qTo}:
+RANGE: Return ONLY questions ${qFrom} through ${qTo}. Ignore all others.
+
+OUTPUT FORMAT: Return ONLY a valid JSON object. No explanation. No markdown.
 {"${qFrom}":"answer","${qFrom+1}":"answer",...,"${qTo}":"answer"}
 
-If a question in the range has no visible answer, use empty string "".
-If you can see a student name written at the top, also add "studentName" to the JSON.`;
+Empty/unanswered = "". If you see a student name at the top, also include "studentName":"Name".`;
 
   try {
     console.log(`[Groq] Scanning ${examType} — ${rangeDesc}`);
@@ -1251,10 +1335,27 @@ If you can see a student name written at the top, also add "studentName" to the 
     const studentName = parsed.studentName ?? null;
     delete parsed.studentName;
 
-    // Only extract answers within the requested range (qFrom–qTo)
     const answers = {};
     for (let i = qFrom; i <= qTo; i++) {
       answers[String(i)] = (parsed[String(i)] ?? parsed[i] ?? '').trim();
+    }
+
+    // Post-validate MC: Groq must only return A/B/C/D — reject anything else
+    if (examType === 'multiple_choice') {
+      for (const k of Object.keys(answers)) {
+        const v = answers[k].trim().toUpperCase();
+        answers[k] = ['A', 'B', 'C', 'D'].includes(v) ? v : '';
+      }
+    }
+
+    // Post-validate True/False
+    if (examType === 'true_or_false') {
+      for (const k of Object.keys(answers)) {
+        const v = answers[k].trim().toLowerCase();
+        if (v === 't' || v === 'true')  { answers[k] = 'True';  continue; }
+        if (v === 'f' || v === 'false') { answers[k] = 'False'; continue; }
+        answers[k] = '';
+      }
     }
 
     const rangeSize     = qTo - qFrom + 1;
@@ -1454,7 +1555,7 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   // shapes without understanding words, so messy writing defeats it.
   // We now send written-type sheets to Groq first and only fall back to
   // Tesseract if Groq is unavailable or returns zero answers.
-  if (isWritten && groqReady) {
+  if ((isWritten || isMcType) && groqReady) { // FIX: MC now also uses Groq first
     console.log('[AutoChecker] v3.0 — Written type: trying Groq vision FIRST (primary engine)');
     try {
       const groqResult = await scanWithGroq(imageBase64, mimeType, examType, questionCount);
