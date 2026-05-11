@@ -1104,20 +1104,19 @@ function extractStudentName(text) {
 // âœ¨ UPGRADED: never throws for empty/unreadable text
 //             returns empty answers map with confidence=0 instead
 
-// ─── Jimp bubble sheet detector ───────────────────────────────────────────────
-// Pure pixel-based OMR detection — no AI, no Python, no OpenCV.
+// ─── Jimp bubble sheet detector (FIXED v2) ────────────────────────────────────
 //
-// How it works:
-//   1. Decode the base64 image with Jimp
-//   2. Convert to greyscale
-//   3. Divide the sheet into a grid: rows = questions, cols = A/B/C/D
-//   4. For each cell, count dark pixels (brightness < DARK_THRESHOLD)
-//   5. The darkest cell in each row = the filled bubble = the answer
-//
-// Install: npm install jimp
-//
-// IMPORTANT: Your bubble sheet must have a consistent, evenly-spaced grid.
-// TOP_MARGIN_PCT skips the header (name field, title). Increase if needed.
+// FIX 1: Grid now uses OMR_LAYOUT — exact same fractions as omrImageProcessor.ts
+//         and OMRSheetRenderer.tsx. Previously used generic margin percentages
+//         that had no relation to the printed sheet layout.
+// FIX 2: Multi-column support. Previously one wide grid for all sheets — 2-column
+//         (50Q) and 3-column (75/100Q) sheets were completely misread.
+// FIX 3: Sampling is now circular (matches physical bubble shape). Previously
+//         rectangular cells included the Q-number label area which inflated ratios.
+// FIX 4: Thresholds raised to match circular sampling (MIN_DARK 0.08→0.25, MARGIN 0.03→0.08).
+// FIX 5: Adaptive per-scan Otsu threshold replaces hardcoded 128.
+// FIX 6: Blank-bubble baseline calibration — threshold = baseline + 3×std.
+// FIX 7: INVALID (double-mark) detection with margin-aware disambiguation.
 
 let Jimp;
 try {
@@ -1127,25 +1126,61 @@ try {
   console.warn('              Fix: npm install jimp');
 }
 
-// ── Tuning constants ──────────────────────────────────────────────────────────
-const DARK_THRESHOLD   = 128;   // pixels darker than this count as "filled" (0-255)
-const TOP_MARGIN_PCT   = 0.15;  // skip top 15% — header/name area
-const BOT_MARGIN_PCT   = 0.05;  // skip bottom 5%
-const LEFT_MARGIN_PCT  = 0.05;  // skip left 5%
-const RIGHT_MARGIN_PCT = 0.05;  // skip right 5%
-const CHOICES          = 4;     // A B C D
+// ── Layout constants — MUST stay in sync with omrImageProcessor.ts ────────────
+const OMR_LAYOUT = {
+  1: { GRID_TOP: 0.235, ROW_STEP: 0.033, BUBBLE_R: 0.038, COL_LEFT: [0.02],               Q_NUM_W: 0.065, BUBBLE_STEP: 0.105 },
+  2: { GRID_TOP: 0.235, ROW_STEP: 0.033, BUBBLE_R: 0.038, COL_LEFT: [0.02, 0.52],          Q_NUM_W: 0.065, BUBBLE_STEP: 0.105 },
+  3: { GRID_TOP: 0.235, ROW_STEP: 0.028, BUBBLE_R: 0.028, COL_LEFT: [0.01, 0.345, 0.675], Q_NUM_W: 0.050, BUBBLE_STEP: 0.072 },
+};
+
+function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
+
+function otsuThreshold(gray) {
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+  const total = gray.length;
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, maxVar = 0, threshold = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF === 0) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const varBetween = wB * wF * (mB - mF) ** 2;
+    if (varBetween > maxVar) { maxVar = varBetween; threshold = t; }
+  }
+  return threshold;
+}
+
+function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
+  let dark = 0, total = 0;
+  const r2 = r * r;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r2) continue;
+      const px = cx + dx, py = cy + dy;
+      if (px < 0 || px >= W || py < 0 || py >= H) continue;
+      total++;
+      if (gray[py * W + px] < darkThreshold) dark++;
+    }
+  }
+  return total > 0 ? dark / total : 0;
+}
 
 async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
   if (!Jimp) return null;
 
-  console.log(`[BubbleOMR] Jimp detection — ${questionCount} questions`);
+  const numCols = omrColCount(questionCount);
+  const layout  = OMR_LAYOUT[numCols];
+  console.log(`[BubbleOMR] Jimp v2 — ${questionCount} questions, ${numCols} column(s)`);
 
   let image;
   try {
     const buf = Buffer.from(imageBase64, 'base64');
-    // FIX: Jimp v1+ removed Jimp.read() — use Jimp.fromBuffer() instead.
-    // Pinned to jimp@0.22.12 in package.json so Jimp.read() still works,
-    // but fromBuffer is used here as a forward-compatible safety measure.
     image = await (Jimp.fromBuffer ? Jimp.fromBuffer(buf) : Jimp.read(buf));
   } catch (err) {
     console.warn('[BubbleOMR] Failed to decode image:', err.message);
@@ -1153,67 +1188,87 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
   }
 
   image.greyscale();
-
   const W = image.getWidth();
   const H = image.getHeight();
 
-  const x0 = Math.floor(W * LEFT_MARGIN_PCT);
-  const x1 = Math.floor(W * (1 - RIGHT_MARGIN_PCT));
-  const y0 = Math.floor(H * TOP_MARGIN_PCT);
-  const y1 = Math.floor(H * (1 - BOT_MARGIN_PCT));
-
-  const gridW = x1 - x0;
-  const gridH = y1 - y0;
-  const cellW = Math.floor(gridW / CHOICES);
-  const cellH = Math.floor(gridH / questionCount);
-
-  console.log(`[BubbleOMR] Grid: ${W}x${H}px, cell: ${cellW}x${cellH}px`);
-
-  const LABELS = ['A', 'B', 'C', 'D'];
-  const answers = {};
-
-  for (let q = 0; q < questionCount; q++) {
-    const rowY0 = y0 + q * cellH;
-    const rowY1 = rowY0 + cellH;
-    const darkCounts = [0, 0, 0, 0];
-
-    for (let c = 0; c < CHOICES; c++) {
-      const colX0 = x0 + c * cellW;
-      const colX1 = colX0 + cellW;
-      let dark = 0, total = 0;
-      for (let py = rowY0; py < rowY1; py += 2) {
-        for (let px = colX0; px < colX1; px += 2) {
-          const pixel = Jimp.intToRGBA(image.getPixelColor(px, py));
-          if (pixel.r < DARK_THRESHOLD) dark++;
-          total++;
-        }
-      }
-      darkCounts[c] = total > 0 ? dark / total : 0;
+  // Build flat grayscale array
+  const gray = new Uint8Array(W * H);
+  for (let py = 0; py < H; py++) {
+    for (let px = 0; px < W; px++) {
+      gray[py * W + px] = Jimp.intToRGBA(image.getPixelColor(px, py)).r;
     }
-
-    const maxDark = Math.max(...darkCounts);
-    const bestIdx = darkCounts.indexOf(maxDark);
-    const sorted  = [...darkCounts].sort((a, b) => b - a);
-    const margin  = sorted[0] - (sorted[1] ?? 0);
-
-    const MIN_DARK_RATIO = 0.08;  // at least 8% of cell must be dark
-    const MIN_MARGIN     = 0.03;  // must be 3% darker than runner-up
-
-    answers[String(q + 1)] = (maxDark >= MIN_DARK_RATIO && margin >= MIN_MARGIN)
-      ? LABELS[bestIdx]
-      : '';
-
-    console.log(`[BubbleOMR] Q${q + 1}: [${darkCounts.map(d => (d*100).toFixed(1)+'%').join(', ')}] → ${answers[String(q + 1)] || '(none)'}`);
   }
+
+  // Otsu threshold on the grid area only (avoids white header skewing histogram)
+  const gridY0    = Math.floor(layout.GRID_TOP * H);
+  const gridY1    = H - Math.floor(0.05 * H);
+  const gridSlice = gray.slice(gridY0 * W, gridY1 * W);
+  const darkThreshold = otsuThreshold(gridSlice);
+  console.log(`[BubbleOMR] Otsu threshold: ${darkThreshold}`);
+
+  // Sample every bubble with a circle
+  const perCol  = Math.ceil(questionCount / numCols);
+  const r       = Math.round(layout.BUBBLE_R * W);
+  const rowStep = layout.ROW_STEP * H;
+  const OPTIONS = ['A', 'B', 'C', 'D'];
+  const allRatios = {};
+
+  for (let col = 0; col < numCols; col++) {
+    const bubbleX0 = (layout.COL_LEFT[col] + layout.Q_NUM_W) * W;
+    const colStart = col * perCol + 1;
+    const colEnd   = Math.min(colStart + perCol - 1, questionCount);
+    for (let row = 0; row < colEnd - colStart + 1; row++) {
+      const qNum = colStart + row;
+      const cy   = Math.round(layout.GRID_TOP * H + (row + 0.5) * rowStep);
+      allRatios[qNum] = OPTIONS.map((_, i) => {
+        const cx = Math.round(bubbleX0 + i * layout.BUBBLE_STEP * W);
+        return sampleCircle(gray, W, H, cx, cy, r, darkThreshold);
+      });
+    }
+  }
+
+  // Adaptive threshold from blank-bubble baseline
+  const minRatios    = Object.values(allRatios).map(r4 => Math.min(...r4));
+  const baselineMean = minRatios.reduce((s, v) => s + v, 0) / minRatios.length;
+  const baselineStd  = Math.sqrt(minRatios.reduce((s, v) => s + (v - baselineMean) ** 2, 0) / minRatios.length);
+  const fillThreshold   = Math.max(0.20, Math.min(0.65, baselineMean + 3.0 * baselineStd));
+  const marginThreshold = Math.max(0.06, Math.min(0.20, baselineStd * 1.5));
+  console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} margin≥${marginThreshold.toFixed(3)}`);
+
+  // Classify each question
+  const answers = {};
+  let doubleMarked = 0;
+
+  for (const [qStr, ratios] of Object.entries(allRatios)) {
+    const sorted  = [...ratios].sort((a, b) => b - a);
+    const best    = sorted[0];
+    const second  = sorted[1] ?? 0;
+    const margin  = best - second;
+    const bestIdx = ratios.indexOf(best);
+    const aboveCount = ratios.filter(r => r >= fillThreshold).length;
+
+    if (aboveCount >= 2 && margin < marginThreshold) {
+      answers[String(qStr)] = '';
+      doubleMarked++;
+      console.log(`[BubbleOMR] Q${qStr}: DOUBLE MARK [${ratios.map(r => (r*100).toFixed(1)+'%').join(', ')}]`);
+    } else if (best >= fillThreshold && margin >= marginThreshold) {
+      answers[String(qStr)] = OPTIONS[bestIdx];
+      console.log(`[BubbleOMR] Q${qStr}: ${OPTIONS[bestIdx]} [${ratios.map(r => (r*100).toFixed(1)+'%').join(', ')}]`);
+    } else {
+      answers[String(qStr)] = '';
+      console.log(`[BubbleOMR] Q${qStr}: (blank) [${ratios.map(r => (r*100).toFixed(1)+'%').join(', ')}]`);
+    }
+  }
+
+  if (doubleMarked > 0) console.warn(`[BubbleOMR] ⚠️  ${doubleMarked} double-marked question(s) — returned as blank`);
 
   const answeredCount = Object.values(answers).filter(a => a !== '').length;
   const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
   const confidence    = fillRate >= 0.5
-    ? Math.min(0.75 + fillRate * 0.20, 0.95)
-    : Math.max(0.3 + fillRate * 0.5, 0.1);
+    ? Math.min(0.90 - doubleMarked * 0.02, 0.95) * fillRate + 0.05
+    : Math.max(0.15, fillRate * 0.6);
 
-  console.log(`[BubbleOMR] Done — answered: ${answeredCount}/${questionCount}, confidence: ${(confidence*100).toFixed(1)}%`);
-
+  console.log(`[BubbleOMR] Done — answered: ${answeredCount}/${questionCount}, doubleMarked: ${doubleMarked}, confidence: ${(confidence*100).toFixed(1)}%`);
   return { studentName: null, answers, answeredCount, engineConfidence: confidence * 100, confidence };
 }
 
