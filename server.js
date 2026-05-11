@@ -42,8 +42,37 @@ const multer    = require('multer');
 const cors      = require('cors');
 const fs        = require('fs');
 const path      = require('path');
-const _pdfParseLib = require('pdf-parse');
-const pdfParse = typeof _pdfParseLib === 'function' ? _pdfParseLib : _pdfParseLib.default;
+// ── pdf-parse import fix ──────────────────────────────────────────────────────
+// pdf-parse exports differently across versions and module systems:
+//   v1.x  CommonJS  → module.exports = function pdfParse() {...}   (function directly)
+//   v1.x  some envs → module.exports = { default: fn, ... }        (wrapped object)
+//   v2.x+ ESM shim  → _pdfParseLib.default = fn                    (ESM interop)
+//
+// The previous two-step check missed the case where BOTH checks fail and
+// _pdfParseLib itself is the callable (most common on Railway with pdf-parse v1.x).
+// This three-step resolution covers every known case:
+let pdfParse;
+try {
+  const _pdfParseLib = require('pdf-parse/lib/pdf-parse.js'); // direct path — bypasses all wrapping
+  pdfParse = typeof _pdfParseLib === 'function' ? _pdfParseLib : null;
+} catch {
+  // Fallback: try the top-level export with all resolution strategies
+  try {
+    const _pdfParseLib = require('pdf-parse');
+    if      (typeof _pdfParseLib          === 'function') pdfParse = _pdfParseLib;
+    else if (typeof _pdfParseLib.default  === 'function') pdfParse = _pdfParseLib.default;
+    else if (typeof _pdfParseLib.pdfParse === 'function') pdfParse = _pdfParseLib.pdfParse;
+    else pdfParse = null;
+  } catch (e) {
+    console.error('[AutoChecker] ❌ pdf-parse could not be loaded:', e.message);
+    pdfParse = null;
+  }
+}
+if (pdfParse) {
+  console.log('[AutoChecker] pdf-parse loaded successfully ✓');
+} else {
+  console.warn('[AutoChecker] ⚠️  pdf-parse not available — PDF uploads will return a clear error.');
+}
 const mammoth   = require('mammoth');
 const Tesseract = require('tesseract.js');
 
@@ -374,6 +403,11 @@ async function parseUploadedFile(filePath, ext) {
       fileBuffer = fs.readFileSync(filePath);
     } catch (e) {
       return { error: `Could not read PDF file: ${e.message}` };
+    }
+
+    // Guard: if pdf-parse failed to load at startup, return a clear error
+    if (typeof pdfParse !== 'function') {
+      return { error: 'PDF support is unavailable (pdf-parse failed to load). Please use a .txt or .docx file instead.' };
     }
 
     let pdfText = '';
@@ -1811,6 +1845,9 @@ app.post('/api/extract-text', upload.single('file'), async (req, res) => {
     } else if (ext === '.txt') {
       text = fs.readFileSync(filePath, 'utf8');
     } else if (ext === '.pdf') {
+      if (typeof pdfParse !== 'function') {
+        return res.status(500).json({ success: false, error: 'PDF support is unavailable (pdf-parse failed to load). Please use a .txt or .docx file instead.' });
+      }
       const dataBuffer = fs.readFileSync(filePath);
       const parsed     = await pdfParse(dataBuffer);
       text = parsed.text ?? '';
@@ -2135,4 +2172,4 @@ setInterval(() => {
     .catch(() => {});
 }, 5 * 60 * 1000);
 
-// redeploy-trigger-20260509-groq
+// redeploy-trigger-20260511-pdf-fix
