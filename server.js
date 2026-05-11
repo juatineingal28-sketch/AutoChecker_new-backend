@@ -1704,6 +1704,39 @@ app.delete('/api/sections/:id', (req, res) => {
   res.json({ success: true });
 });
 
+
+app.patch('/api/sections/:id', (req, res) => {
+  const sections = readSections();
+  const idx = sections.findIndex(s => s.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ success: false, error: 'Section not found.' });
+
+  const { name, abbr, subject, studentCount, color } = req.body;
+
+  if (name?.trim()) {
+    const duplicate = sections.find(
+      s => s.id !== req.params.id && s.name.toLowerCase() === name.trim().toLowerCase()
+    );
+    if (duplicate) {
+      return res.status(409).json({ success: false, error: `Section "${name.trim()}" already exists.` });
+    }
+  }
+
+  const existing = sections[idx];
+  const updated = {
+    ...existing,
+    name:         name?.trim()                ? name.trim()                  : existing.name,
+    abbr:         abbr?.trim()                ? abbr.trim().toUpperCase()    : existing.abbr,
+    subject:      subject !== undefined       ? (subject?.trim() ?? '')     : existing.subject,
+    studentCount: studentCount !== undefined  ? Number(studentCount)         : existing.studentCount,
+    color:        VALID_COLORS.has(color)     ? color                        : existing.color,
+  };
+
+  sections[idx] = updated;
+  writeSections(sections);
+  console.log(`[AutoChecker] Section updated: ${updated.name} (${updated.id})`);
+  res.json({ success: true, section: updated });
+});
+
 // Answer Key
 app.post('/api/answer-key/:sectionId', upload.single('file'), async (req, res) => {
   const { sectionId } = req.params;
