@@ -1840,7 +1840,8 @@ app.post('/api/answer-key/:sectionId', upload.single('file'), async (req, res) =
     const result = await parseUploadedFile(tempPath, ext);
     if (result.error) return res.status(422).json({ success: false, error: result.error });
 
-    const record = { fileName: req.file.originalname, fileType: ext.replace('.',''), uploadedAt: new Date().toISOString(), key: result.items };
+    const requireUppercase = req.body?.requireUppercase === 'true' || req.body?.requireUppercase === true;
+    const record = { fileName: req.file.originalname, fileType: ext.replace('.',''), uploadedAt: new Date().toISOString(), key: result.items, meta: { requireUppercase } };
     writeStore(sectionId, record);
 
     const count = record.key.length;
@@ -1851,6 +1852,7 @@ app.post('/api/answer-key/:sectionId', upload.single('file'), async (req, res) =
       fileName: record.fileName, fileType: record.fileType,
       uploadedAt: record.uploadedAt, total: count,
       typeSummary: typeSummary(record.key), key: record.key,
+      meta: record.meta,
       message: `${count} answer${count !== 1 ? 's' : ''} detected successfully`,
     });
   } catch (err) {
@@ -1865,7 +1867,7 @@ app.get('/api/answer-key/:sectionId', (req, res) => {
   const record = readStore(req.params.sectionId);
   if (!record) return res.status(404).json({ success: false, error: 'No answer key for this section.' });
   res.json({ success: true, sectionId: req.params.sectionId, fileName: record.fileName, fileType: record.fileType,
-    uploadedAt: record.uploadedAt, total: record.key.length, typeSummary: typeSummary(record.key), key: record.key });
+    uploadedAt: record.uploadedAt, total: record.key.length, typeSummary: typeSummary(record.key), key: record.key, meta: record.meta ?? {} });
 });
 
 app.delete('/api/answer-key/:sectionId', (req, res) => {
@@ -1932,10 +1934,13 @@ app.post('/api/score/:sectionId', (req, res) => {
   if (!student || !Array.isArray(student.answers)) {
     return res.status(400).json({ success: false, error: 'student.answers must be an array.' });
   }
+  const requireUppercase = record.meta?.requireUppercase === true;
   let correct = 0;
   const details = record.key.map((item, idx) => {
     const sa = student.answers[idx] ?? '';
-    const ok = checkAnswer(item, sa);
+    // Apply requireUppercase: if enabled and answer has lowercase, mark wrong immediately
+    const hasLowercase = requireUppercase && /[a-z]/.test(sa);
+    const ok = hasLowercase ? false : checkAnswer(item, sa);
     if (ok) correct++;
     return { question: item.question, type: item.type, correctAnswer: item.answer, studentAnswer: sa || null, isCorrect: ok };
   });
