@@ -2415,6 +2415,20 @@ app.post('/api/scan', async (req, res) => {
   // Do NOT override with server-side key length; the paper may have fewer questions.
   const totalQs = Number(questionCount) || 10;
 
+  // Wait up to 10s for persistent Tesseract workers on cold start.
+  // Without this, the first request after Railway wakes up falls through to
+  // a slow temp-worker path that can exceed the client's 60s timeout.
+  if (!workerMCReady && !workerTextReady) {
+    console.log('[AutoChecker] Workers not ready — waiting up to 10s for warm-up...');
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      if (workerMCReady || workerTextReady) {
+        console.log(`[AutoChecker] Workers ready after ${(i + 1) * 0.5}s`);
+        break;
+      }
+    }
+  }
+
   try {
     console.log(`[AutoChecker] Scanning â€” examType=${examType}, questions=${totalQs}`);
 
@@ -2532,6 +2546,6 @@ app.listen(PORT, '0.0.0.0', () => {
 setInterval(() => {
   fetch('https://autocheckernew-backend-production.up.railway.app/health')
     .catch(() => {});
-}, 5 * 60 * 1000);
+}, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
 // redeploy-trigger-20260511-pdf-fix
