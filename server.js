@@ -1625,31 +1625,6 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
       console.log(`[AutoChecker] Mixed MC extraction — found ${Object.keys(answers).length}/${mcQuestions.length} MC answers`);
     }
 
-    // FIX: Always use Groq for MC in mixed mode — Tesseract cannot reliably distinguish
-    // handwritten B/C from printed choice labels "B. HTML" on the same page.
-    // Groq understands exam context and reads ONLY the handwritten answer on the blank.
-    if (groqReady && mcQuestions.length > 0) {
-      const fromMcQ = Math.min(...mcQuestions);
-      const toMcQ   = Math.max(...mcQuestions);
-      console.log(`[AutoChecker] Mixed Groq MC scan — Q${fromMcQ}-Q${toMcQ} (overrides Tesseract)`);
-      try {
-        const groqMcResult = await scanWithGroq(
-          imageBase64, mimeType, 'multiple_choice', questionCount, fromMcQ, toMcQ
-        );
-        if (groqMcResult) {
-          for (const q of mcQuestions) {
-            const k = String(q);
-            // Groq overrides Tesseract for MC — Groq is much more accurate here
-            if (groqMcResult.answers[k]) {
-              answers[k] = groqMcResult.answers[k];
-            }
-          }
-          console.log(`[AutoChecker] Groq MC override done — MC answers updated`);
-        }
-      } catch (e) {
-        console.warn('[AutoChecker] Groq MC fill failed (non-fatal):', e.message);
-      }
-    }
 
     // Extract written answers from the text OCR pass, per type
     const writtenTypes = Object.keys(writtenQuestions);
@@ -1681,11 +1656,13 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
       // Run Groq for each written type separately with its exact question range
       for (const backendType of writtenTypes) {
         const groqExamType = backendType === 'truefalse' ? 'true_or_false' : backendType;
-        const blankQs = writtenQuestions[backendType].filter(q => !answers[String(q)]);
-        if (blankQs.length === 0) continue;
-
-        // Calculate the min/max question numbers for this type's range
         const allQsForType = writtenQuestions[backendType];
+        // FIX: For T/F, always run Groq even if Tesseract filled all slots —
+        // Tesseract fills T/F with wrong "T" values, blankQs would be empty
+        // and we'd skip Groq, leaving all wrong answers in place.
+        const blankQs = allQsForType.filter(q => !answers[String(q)]);
+        const isTrueFalseType = backendType === 'truefalse';
+        if (blankQs.length === 0 && !isTrueFalseType) continue; // skip only non-T/F when all filled
         const fromQ = Math.min(...allQsForType);
         const toQ   = Math.max(...allQsForType);
 
