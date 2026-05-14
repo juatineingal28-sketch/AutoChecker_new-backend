@@ -970,7 +970,35 @@ function extractMcAnswers(text, questionCount) {
     }
   }
 
-  // Pattern C: compact grid "1B 2C 3A" — only when A/B found very few results
+  // Pattern C: letter BEFORE number — handles exam format "___B___ 1. What is..."
+  // where the student's handwritten answer appears on a blank BEFORE the question number.
+  // Tesseract OCR often reads this as: standalone letter line → then number+question line.
+  // FIX: this is the primary format of this exam paper — added as Pattern C.
+  const lines3 = text.split('\n').map(l => l.trim()).filter(Boolean);
+  for (let i = 0; i < lines3.length - 1; i++) {
+    // Current line is a standalone handwritten letter (A, B, C, or D)
+    const letterOnlyMatch = lines3[i].match(/^([ABCDabcd])\s*$/i);
+    if (!letterOnlyMatch) continue;
+    // Next line starts with a question number
+    const nextNumMatch = lines3[i + 1].match(/^[Qq]?(\d{1,3})\s*[.):\s]/);
+    if (!nextNumMatch) continue;
+    const q = parseInt(nextNumMatch[1], 10);
+    if (q >= 1 && q <= maxQ && !answers[String(q)]) {
+      answers[String(q)] = letterOnlyMatch[1].toUpperCase();
+    }
+  }
+
+  // Also handle: letter and number on same line but letter comes first "B 1."
+  const RE_LETTER_FIRST = /^([ABCDabcd])\s+[Qq]?(\d{1,3})\s*[.):\s]/gim;
+  let mLF;
+  while ((mLF = RE_LETTER_FIRST.exec(text)) !== null) {
+    const q = parseInt(mLF[2], 10);
+    if (q >= 1 && q <= maxQ && !answers[String(q)]) {
+      answers[String(q)] = mLF[1].toUpperCase();
+    }
+  }
+
+  // Pattern D (was C): compact grid "1B 2C 3A" — only when A/B found very few results
   if (Object.keys(answers).length < Math.floor(questionCount * 0.3)) {
     const RE_GRID = /(\d{1,3})[.\-]?\s*([ABCDabcd])(?=\s|\d|$)/g;
     while ((m = RE_GRID.exec(text)) !== null) {
@@ -1317,12 +1345,29 @@ Do NOT return letters from the printed choices. Do NOT return the question text.
     true_or_false: `Each answer is either "True" or "False" handwritten by the student.
 
 CRITICAL — THE PAPER HAS TWO KINDS OF TEXT:
-1. PRINTED TEXT (pre-printed, IGNORE): "TRUE OR FALSE", instructions, question text.
-2. HANDWRITTEN ANSWER (read this): the student wrote T, F, True, or False
-   near the question number or on a blank line.
+1. PRINTED TEXT (pre-printed, IGNORE): the words "True or False", section headers,
+   and the question sentences (e.g. "HTML is used to style web pages.").
+2. HANDWRITTEN ANSWER (read this): a single letter T or F that the student wrote
+   on the blank line (___) before or near each question number.
 
-Look for handwritten T/F near each question number.
-Return "True" or "False". If blank, use "".`,
+HOW TO FIND THE HANDWRITTEN ANSWER:
+- Look for a lone handwritten letter near each question number.
+- The blank line appears BEFORE the question: "___  6. HTML is used to style web pages."
+- The student writes ONE letter on that blank: either T or F.
+
+HOW TO TELL T FROM F — LOOK CAREFULLY:
+- T: a horizontal bar at the TOP only, with a vertical stroke going straight down.
+     It looks like a plus sign with the bottom removed.
+- F: a horizontal bar at TOP, a SHORTER bar in the MIDDLE, and NO bar at the bottom.
+     It looks like an E with the bottom arm removed.
+- The difference: T has NO middle bar. F has a middle bar.
+- Do NOT return "True" for everything — each question has a different answer.
+- If the letter has a middle horizontal stroke → it is F (False).
+- If the letter has ONLY a top horizontal stroke → it is T (True).
+
+Return "True" if the student wrote T, "False" if the student wrote F.
+If the blank is empty (no letter written), return "".
+NEVER guess — if you cannot read the letter clearly, return "".`,
 
     identification: `Each answer is a handwritten word or short phrase (1-5 words) on a blank line.
 
@@ -1580,6 +1625,32 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
       console.log(`[AutoChecker] Mixed MC extraction — found ${Object.keys(answers).length}/${mcQuestions.length} MC answers`);
     }
 
+    // FIX: Always use Groq for MC in mixed mode — Tesseract cannot reliably distinguish
+    // handwritten B/C from printed choice labels "B. HTML" on the same page.
+    // Groq understands exam context and reads ONLY the handwritten answer on the blank.
+    if (groqReady && mcQuestions.length > 0) {
+      const fromMcQ = Math.min(...mcQuestions);
+      const toMcQ   = Math.max(...mcQuestions);
+      console.log(`[AutoChecker] Mixed Groq MC scan — Q${fromMcQ}-Q${toMcQ} (overrides Tesseract)`);
+      try {
+        const groqMcResult = await scanWithGroq(
+          imageBase64, mimeType, 'multiple_choice', questionCount, fromMcQ, toMcQ
+        );
+        if (groqMcResult) {
+          for (const q of mcQuestions) {
+            const k = String(q);
+            // Groq overrides Tesseract for MC — Groq is much more accurate here
+            if (groqMcResult.answers[k]) {
+              answers[k] = groqMcResult.answers[k];
+            }
+          }
+          console.log(`[AutoChecker] Groq MC override done — MC answers updated`);
+        }
+      } catch (e) {
+        console.warn('[AutoChecker] Groq MC fill failed (non-fatal):', e.message);
+      }
+    }
+
     // Extract written answers from the text OCR pass, per type
     const writtenTypes = Object.keys(writtenQuestions);
     if (writtenTypes.length > 0 && textOcrText) {
@@ -1602,8 +1673,11 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
     const answeredCount = Object.values(answers).filter(a => a !== '').length;
     const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
 
-    // Try Groq for any written blanks if fill-rate is low
-    if (groqReady && fillRate < GROQ_ASSIST_THRESHOLD && writtenTypes.length > 0) {
+    // FIX: Always run Groq for written types — do NOT gate on fillRate.
+    // Tesseract often fills T/F slots with wrong "T" values giving fillRate=1.0,
+    // which previously blocked Groq from correcting them. Now Groq always runs
+    // for written types and overwrites Tesseract answers (Groq is more accurate).
+    if (groqReady && writtenTypes.length > 0) {
       // Run Groq for each written type separately with its exact question range
       for (const backendType of writtenTypes) {
         const groqExamType = backendType === 'truefalse' ? 'true_or_false' : backendType;
@@ -1620,9 +1694,15 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
           // Pass fromQ/toQ so Groq only reads the correct section of the paper
           const groqResult = await scanWithGroq(imageBase64, mimeType, groqExamType, questionCount, fromQ, toQ);
           if (groqResult) {
-            for (const q of blankQs) {
+            for (const q of allQsForType) {
               const k = String(q);
-              if (!answers[k] && groqResult.answers[k]) { answers[k] = groqResult.answers[k]; }
+              // FIX: For T/F, Groq overwrites ALL answers (not just blanks) because
+              // Tesseract fills T/F with wrong values (reads F as T consistently).
+              // For other written types, only fill blanks Tesseract missed.
+              const shouldOverwrite = backendType === 'truefalse' || !answers[k];
+              if (shouldOverwrite && groqResult.answers[k]) {
+                answers[k] = groqResult.answers[k];
+              }
             }
           }
         } catch (groqErr) {
