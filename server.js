@@ -1387,10 +1387,17 @@ If blank, use "".`,
     enumeration: `Each answer is a handwritten word or short phrase on a numbered blank line.
 
 CRITICAL — THE PAPER HAS TWO KINDS OF TEXT:
-1. PRINTED CATEGORY LABELS (pre-printed, IGNORE): e.g. "Frontend technologies:", "Database systems:"
-2. HANDWRITTEN ANSWER (read this): the student's word/phrase written on the blank line.
+1. PRINTED CATEGORY LABELS (pre-printed, IGNORE): e.g. "Frontend technologies:", "Database systems:", "16.", "17." printed labels
+2. HANDWRITTEN ANSWER (read this): the student's word/phrase written on the blank line (___) beside or after the question number.
 
-Do NOT return printed category headings or printed examples. If blank, use "".`,
+HOW TO FIND THE HANDWRITTEN ANSWER:
+- Look for handwritten text on the blank line (___) near each question number.
+- The blank appears after the number: "16. _______" or before the question: "_______ 16."
+- Common answers in a web/IT exam: HTML, CSS, JavaScript, Python, Node.js, PHP, MySQL, MongoDB, PostgreSQL, Git, React, API, JSON, etc.
+- Read the handwritten word carefully — the student's ink strokes, not any printed text.
+
+IMPORTANT: Return the student's actual handwritten answer, not the printed question text.
+If blank (student did not write anything), return "".`,
   };
 
   const instructions = typeInstructions[examType] ?? typeInstructions.identification;
@@ -1622,7 +1629,36 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
       for (const q of mcQuestions) {
         if (allMcAnswers[String(q)]) answers[String(q)] = allMcAnswers[String(q)];
       }
-      console.log(`[AutoChecker] Mixed MC extraction — found ${Object.keys(answers).length}/${mcQuestions.length} MC answers`);
+      console.log(`[AutoChecker] Mixed MC extraction — found ${Object.keys(answers).filter(k => mcQuestions.includes(parseInt(k))).length}/${mcQuestions.length} MC answers`);
+    }
+
+    // FIX: Run Groq for MC questions too (not just written types).
+    // Tesseract reads printed choice letters (e.g. "A. CSS  B. HTML") instead of
+    // the student's handwritten answer on the blank line. Groq vision understands
+    // the paper layout and correctly identifies the handwritten letter.
+    // Groq overwrites ALL MC answers (not just blanks) because Tesseract is
+    // systematically wrong for this exam format (blanks before question numbers).
+    if (groqReady && mcQuestions.length > 0) {
+      const fromQ = Math.min(...mcQuestions);
+      const toQ   = Math.max(...mcQuestions);
+      const blankMcCount = mcQuestions.filter(q => !answers[String(q)]).length;
+      console.log(`[AutoChecker] Mixed Groq MC fill — ${blankMcCount} blanks for mc (Q${fromQ}-Q${toQ}), running Groq to verify all MC`);
+      try {
+        const groqMcResult = await scanWithGroq(imageBase64, mimeType, 'multiple_choice', questionCount, fromQ, toQ);
+        if (groqMcResult) {
+          let groqFilled = 0;
+          for (const q of mcQuestions) {
+            const k = String(q);
+            if (groqMcResult.answers[k]) {
+              answers[k] = groqMcResult.answers[k];
+              groqFilled++;
+            }
+          }
+          console.log(`[AutoChecker] Mixed Groq MC — filled/verified ${groqFilled}/${mcQuestions.length} MC answers`);
+        }
+      } catch (groqMcErr) {
+        console.warn('[AutoChecker] Mixed Groq MC fill failed (non-fatal):', groqMcErr.message);
+      }
     }
 
 
@@ -1662,7 +1698,11 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
         // and we'd skip Groq, leaving all wrong answers in place.
         const blankQs = allQsForType.filter(q => !answers[String(q)]);
         const isTrueFalseType = backendType === 'truefalse';
-        if (blankQs.length === 0 && !isTrueFalseType) continue; // skip only non-T/F when all filled
+        // FIX: Also always run Groq for enumeration — Tesseract garbles handwritten
+        // enumeration answers badly (e.g. "c 5 5" instead of "CSS", "05 ..." instead
+        // of actual answers). Groq vision reads them correctly.
+        const isEnumerationType = backendType === 'enumeration';
+        if (blankQs.length === 0 && !isTrueFalseType && !isEnumerationType) continue; // skip only when all filled AND not T/F or enumeration
         const fromQ = Math.min(...allQsForType);
         const toQ   = Math.max(...allQsForType);
 
@@ -1673,10 +1713,12 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
           if (groqResult) {
             for (const q of allQsForType) {
               const k = String(q);
-              // FIX: For T/F, Groq overwrites ALL answers (not just blanks) because
-              // Tesseract fills T/F with wrong values (reads F as T consistently).
-              // For other written types, only fill blanks Tesseract missed.
-              const shouldOverwrite = backendType === 'truefalse' || !answers[k];
+              // FIX: For T/F AND enumeration, Groq overwrites ALL answers because
+              // Tesseract is systematically wrong for these types:
+              //   - T/F: Tesseract reads F as T consistently
+              //   - enumeration: Tesseract garbles written words badly (e.g. "c 5 5", "05 ...")
+              // For identification, only fill blanks Tesseract missed.
+              const shouldOverwrite = backendType === 'truefalse' || backendType === 'enumeration' || !answers[k];
               if (shouldOverwrite && groqResult.answers[k]) {
                 answers[k] = groqResult.answers[k];
               }
