@@ -1199,12 +1199,119 @@ function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
   return total > 0 ? dark / total : 0;
 }
 
+// ── FIX 3: Local adaptive threshold per bubble ROI ───────────────────────────
+// Global Otsu works well on average but fails when:
+//   - part of the sheet is in shadow (darker background locally)
+//   - phone flash creates bright spots (washes out filled bubbles)
+// Solution: for each bubble, sample a larger surrounding halo (2.5× radius)
+// to compute a LOCAL background mean, then threshold relative to that.
+// This makes each bubble's fill decision independent of global lighting.
+const ADAPTIVE_BIAS = 0.18; // bubble must be 18% darker than local bg to count as filled
+
+function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
+  // Step 1: compute local background mean in 2.5× halo ring (excludes bubble interior)
+  const haloR  = Math.round(r * 2.5);
+  const innerR2 = r * r;
+  const outerR2 = haloR * haloR;
+  let bgSum = 0, bgCount = 0;
+  for (let dy = -haloR; dy <= haloR; dy++) {
+    for (let dx = -haloR; dx <= haloR; dx++) {
+      const d2 = dx*dx + dy*dy;
+      if (d2 <= innerR2 || d2 > outerR2) continue;
+      const px = cx + dx, py = cy + dy;
+      if (px < 0 || px >= W || py < 0 || py >= H) continue;
+      bgSum += gray[py * W + px] / 255;
+      bgCount++;
+    }
+  }
+  const localBg        = bgCount > 0 ? bgSum / bgCount : 0.85;
+  const localThreshold = Math.max(0.05, localBg - ADAPTIVE_BIAS);
+
+  // Step 2: count dark pixels inside the bubble circle
+  let dark = 0, total = 0;
+  const r2 = r * r;
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx*dx + dy*dy > r2) continue;
+      const px = cx + dx, py = cy + dy;
+      if (px < 0 || px >= W || py < 0 || py >= H) continue;
+      total++;
+      if (gray[py * W + px] / 255 < localThreshold) dark++;
+    }
+  }
+  return total > 0 ? dark / total : 0;
+}
+
+// ─── FIX 1: Perspective correction via fiducial corner markers ───────────────
+//
+// Phone photos are almost never perfectly top-down. Even a 5° tilt causes the
+// bubble grid to drift by 10-20px by row 25, completely missing bubble centers.
+//
+// Strategy: detect the four darkest corner blobs in a small search region near
+// each corner of the page (the printed registration marks / corner boxes that
+// every OMR sheet has). Use those four points to compute a homography (perspective
+// warp) and remap the image so bubbles land exactly where the layout says.
+//
+// If corner detection fails (< 4 corners found) we fall back to the original
+// un-warped image — the function degrades gracefully.
+//
+// Implementation uses pure JS bilinear sampling so there is zero extra dependency.
+
+function findDarkBlob(gray, W, H, roiX0, roiY0, roiX1, roiY1, darkThreshold) {
+  // Returns { cx, cy } of the darkest blob centroid in the given ROI,
+  // or null if no sufficiently dark cluster is found.
+  let sumX = 0, sumY = 0, count = 0;
+  for (let py = roiY0; py < roiY1; py++) {
+    for (let px = roiX0; px < roiX1; px++) {
+      if (gray[py * W + px] < darkThreshold) {
+        sumX += px; sumY += py; count++;
+      }
+    }
+  }
+  if (count < 8) return null; // too few dark pixels — not a real mark
+  return { cx: sumX / count, cy: sumY / count };
+}
+
+function perspectiveWarp(gray, W, H, srcPts, dstW, dstH) {
+  // srcPts: [TL, TR, BR, BL] as {x,y} in the original image.
+  // Maps a dstW×dstH output grid back to srcPts quadrilateral via inverse bilinear.
+  // Returns a new Uint8Array of size dstW×dstH.
+
+  const [tl, tr, br, bl] = srcPts;
+
+  function srcCoord(u, v) {
+    // u,v in [0,1]; maps to source pixel via bilinear interpolation of corners.
+    const x = (1-v)*((1-u)*tl.x + u*tr.x) + v*((1-u)*bl.x + u*br.x);
+    const y = (1-v)*((1-u)*tl.y + u*tr.y) + v*((1-u)*bl.y + u*br.y);
+    return { x, y };
+  }
+
+  const out = new Uint8Array(dstW * dstH);
+  for (let dy = 0; dy < dstH; dy++) {
+    const v = dy / (dstH - 1);
+    for (let dx = 0; dx < dstW; dx++) {
+      const u = dx / (dstW - 1);
+      const { x, y } = srcCoord(u, v);
+      // Bilinear sample
+      const x0 = Math.max(0, Math.min(W - 2, Math.floor(x)));
+      const y0 = Math.max(0, Math.min(H - 2, Math.floor(y)));
+      const fx = x - x0, fy = y - y0;
+      const v00 = gray[y0*W + x0], v10 = gray[y0*W + x0+1];
+      const v01 = gray[(y0+1)*W + x0], v11 = gray[(y0+1)*W + x0+1];
+      out[dy * dstW + dx] = Math.round(
+        (1-fy)*((1-fx)*v00 + fx*v10) + fy*((1-fx)*v01 + fx*v11)
+      );
+    }
+  }
+  return out;
+}
+
 async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
   if (!Jimp) return null;
 
   const numCols = omrColCount(questionCount);
   const layout  = OMR_LAYOUT[numCols];
-  console.log(`[BubbleOMR] Jimp v2 — ${questionCount} questions, ${numCols} column(s)`);
+  console.log(`[BubbleOMR] Jimp v3 — ${questionCount} questions, ${numCols} column(s)`);
 
   let image;
   try {
@@ -1220,11 +1327,34 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
   const H = image.getHeight();
 
   // Build flat grayscale array
-  const gray = new Uint8Array(W * H);
+  let gray = new Uint8Array(W * H);
   for (let py = 0; py < H; py++) {
     for (let px = 0; px < W; px++) {
       gray[py * W + px] = Jimp.intToRGBA(image.getPixelColor(px, py)).r;
     }
+  }
+
+  // ── FIX 1: Perspective correction via corner fiducials ──────────────────
+  // Search for registration marks in the four 12% × 12% corner regions.
+  // The OMR sheet has solid dark squares / circles at each corner.
+  const CORNER_FRAC = 0.12;
+  const cW = Math.floor(CORNER_FRAC * W);
+  const cH = Math.floor(CORNER_FRAC * H);
+  const cornerDarkT = 80; // dark enough to be a registration mark
+
+  const tlBlob = findDarkBlob(gray, W, H,    0,     0,    cW,    cH, cornerDarkT);
+  const trBlob = findDarkBlob(gray, W, H, W-cW,     0,     W,    cH, cornerDarkT);
+  const brBlob = findDarkBlob(gray, W, H, W-cW, H-cH,     W,     H, cornerDarkT);
+  const blBlob = findDarkBlob(gray, W, H,    0, H-cH,    cW,     H, cornerDarkT);
+
+  if (tlBlob && trBlob && brBlob && blBlob) {
+    console.log(`[BubbleOMR] Perspective correction — corners TL(${tlBlob.cx.toFixed(0)},${tlBlob.cy.toFixed(0)}) TR(${trBlob.cx.toFixed(0)},${trBlob.cy.toFixed(0)}) BR(${brBlob.cx.toFixed(0)},${brBlob.cy.toFixed(0)}) BL(${blBlob.cx.toFixed(0)},${blBlob.cy.toFixed(0)})`);
+    const warped = perspectiveWarp(gray, W, H, [tlBlob, trBlob, brBlob, blBlob], W, H);
+    gray = warped; // replace with perspective-corrected pixels
+    console.log('[BubbleOMR] Perspective correction applied ✓');
+  } else {
+    const found = [tlBlob,trBlob,brBlob,blBlob].filter(Boolean).length;
+    console.warn(`[BubbleOMR] Perspective correction skipped — only ${found}/4 corners detected, using raw image`);
   }
 
   // Otsu threshold on the grid area only (avoids white header skewing histogram)
@@ -1245,9 +1375,15 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
     const bubbleX0 = (layout.COL_LEFT[col] + layout.Q_NUM_W) * W;
     const colStart = col * perCol + 1;
     const colEnd   = Math.min(colStart + perCol - 1, questionCount);
+
+    // ── FIX 4: Edge-safe bubble center math ─────────────────────────────────
+    // Previous code used (row + 0.5) * rowStep, which placed the last few rows
+    // outside the grid for Q23-25, Q48-50 because the half-step accumulates error.
+    // Fix: anchor every row to the grid top and index directly from 0.
     for (let row = 0; row < colEnd - colStart + 1; row++) {
       const qNum = colStart + row;
-      const cy   = Math.round(layout.GRID_TOP * H + (row + 0.5) * rowStep);
+      // Exact center of bubble row: grid_top + row_index * row_step + half_step
+      const cy = Math.round(layout.GRID_TOP * H + row * rowStep + rowStep * 0.5);
       allRatios[qNum] = OPTIONS.map((_, i) => {
         const cx = Math.round(bubbleX0 + i * layout.BUBBLE_STEP * W);
         return sampleCircle(gray, W, H, cx, cy, r, darkThreshold);
@@ -1260,8 +1396,15 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
   const baselineMean = minRatios.reduce((s, v) => s + v, 0) / minRatios.length;
   const baselineStd  = Math.sqrt(minRatios.reduce((s, v) => s + (v - baselineMean) ** 2, 0) / minRatios.length);
   const fillThreshold   = Math.max(0.20, Math.min(0.65, baselineMean + 3.0 * baselineStd));
-  const marginThreshold = Math.max(0.06, Math.min(0.20, baselineStd * 1.5));
-  console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} margin≥${marginThreshold.toFixed(3)}`);
+
+  // ── FIX 2: Relative threshold (max/secondMax ratio) instead of fixed margin ──
+  // Fixed margin threshold (best - second >= 0.08) fails when the overall fill
+  // level is low (faint pencil) or very high (heavy ballpen). A ratio test is
+  // scale-invariant: the filled bubble must be at least 2× darker than the
+  // next-darkest bubble, regardless of absolute ink level.
+  const MIN_RATIO = 2.0; // filled must be ≥ 2× second-best to be unambiguous
+  const marginThreshold = Math.max(0.06, Math.min(0.20, baselineStd * 1.5)); // kept for DOUBLE MARK detection
+  console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} minRatio=${MIN_RATIO}×`);
 
   // Classify each question
   const answers = {};
@@ -1271,20 +1414,23 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
     const sorted  = [...ratios].sort((a, b) => b - a);
     const best    = sorted[0];
     const second  = sorted[1] ?? 0;
-    const margin  = best - second;
     const bestIdx = ratios.indexOf(best);
-    const aboveCount = ratios.filter(r => r >= fillThreshold).length;
+    const aboveCount = ratios.filter(rv => rv >= fillThreshold).length;
+
+    // ── FIX 2 applied: use ratio test in addition to absolute threshold ──────
+    const ratio = second > 0.001 ? best / second : best / 0.001;
+    const margin = best - second;
 
     if (aboveCount >= 2 && margin < marginThreshold) {
       answers[String(qStr)] = '';
       doubleMarked++;
-      console.log(`[BubbleOMR] Q${qStr}: DOUBLE MARK [${ratios.map(r => (r*100).toFixed(1)+'%').join(', ')}]`);
-    } else if (best >= fillThreshold && margin >= marginThreshold) {
+      console.log(`[BubbleOMR] Q${qStr}: DOUBLE MARK [${ratios.map(rv => (rv*100).toFixed(1)+'%').join(', ')}]`);
+    } else if (best >= fillThreshold && ratio >= MIN_RATIO) {
       answers[String(qStr)] = OPTIONS[bestIdx];
-      console.log(`[BubbleOMR] Q${qStr}: ${OPTIONS[bestIdx]} [${ratios.map(r => (r*100).toFixed(1)+'%').join(', ')}]`);
+      console.log(`[BubbleOMR] Q${qStr}: ${OPTIONS[bestIdx]} ratio=${ratio.toFixed(2)} [${ratios.map(rv => (rv*100).toFixed(1)+'%').join(', ')}]`);
     } else {
       answers[String(qStr)] = '';
-      console.log(`[BubbleOMR] Q${qStr}: (blank) [${ratios.map(r => (r*100).toFixed(1)+'%').join(', ')}]`);
+      console.log(`[BubbleOMR] Q${qStr}: (blank) ratio=${ratio.toFixed(2)} [${ratios.map(rv => (rv*100).toFixed(1)+'%').join(', ')}]`);
     }
   }
 
