@@ -1623,7 +1623,7 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
       }
     }
 
-    // Extract MC answers from the MC OCR pass
+    // Extract MC answers from Tesseract as a baseline
     if (mcQuestions.length > 0 && mcText) {
       const allMcAnswers = extractMcAnswers(mcText, questionCount);
       for (const q of mcQuestions) {
@@ -1632,37 +1632,7 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
       console.log(`[AutoChecker] Mixed MC extraction — found ${Object.keys(answers).filter(k => mcQuestions.includes(parseInt(k))).length}/${mcQuestions.length} MC answers`);
     }
 
-    // FIX: Run Groq for MC questions too (not just written types).
-    // Tesseract reads printed choice letters (e.g. "A. CSS  B. HTML") instead of
-    // the student's handwritten answer on the blank line. Groq vision understands
-    // the paper layout and correctly identifies the handwritten letter.
-    // Groq overwrites ALL MC answers (not just blanks) because Tesseract is
-    // systematically wrong for this exam format (blanks before question numbers).
-    if (groqReady && mcQuestions.length > 0) {
-      const fromQ = Math.min(...mcQuestions);
-      const toQ   = Math.max(...mcQuestions);
-      const blankMcCount = mcQuestions.filter(q => !answers[String(q)]).length;
-      console.log(`[AutoChecker] Mixed Groq MC fill — ${blankMcCount} blanks for mc (Q${fromQ}-Q${toQ}), running Groq to verify all MC`);
-      try {
-        const groqMcResult = await scanWithGroq(imageBase64, mimeType, 'multiple_choice', questionCount, fromQ, toQ);
-        if (groqMcResult) {
-          let groqFilled = 0;
-          for (const q of mcQuestions) {
-            const k = String(q);
-            if (groqMcResult.answers[k]) {
-              answers[k] = groqMcResult.answers[k];
-              groqFilled++;
-            }
-          }
-          console.log(`[AutoChecker] Mixed Groq MC — filled/verified ${groqFilled}/${mcQuestions.length} MC answers`);
-        }
-      } catch (groqMcErr) {
-        console.warn('[AutoChecker] Mixed Groq MC fill failed (non-fatal):', groqMcErr.message);
-      }
-    }
-
-
-    // Extract written answers from the text OCR pass, per type
+    // Extract written answers from Tesseract as a baseline
     const writtenTypes = Object.keys(writtenQuestions);
     if (writtenTypes.length > 0 && textOcrText) {
       for (const backendType of writtenTypes) {
@@ -1681,60 +1651,147 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
       if (!answers[String(i)]) answers[String(i)] = '';
     }
 
-    const answeredCount = Object.values(answers).filter(a => a !== '').length;
-    const fillRate      = questionCount > 0 ? answeredCount / questionCount : 0;
+    // ── SINGLE combined Groq call for ALL question types ──────────────────────
+    // Instead of one Groq call per type (which hits the 429 rate limit on free tier),
+    // we send ONE call that covers every question on the page.
+    // The prompt describes each section's format so Groq knows what to look for.
+    // This reduces 4 API calls → 1 per page, staying well within rate limits.
+    if (groqReady) {
+      try {
+        const allQNums   = Array.from({ length: questionCount }, (_, i) => i + 1);
+        const fromQ      = 1;
+        const toQ        = questionCount;
 
-    // FIX: Always run Groq for written types — do NOT gate on fillRate.
-    // Tesseract often fills T/F slots with wrong "T" values giving fillRate=1.0,
-    // which previously blocked Groq from correcting them. Now Groq always runs
-    // for written types and overwrites Tesseract answers (Groq is more accurate).
-    if (groqReady && writtenTypes.length > 0) {
-      // Run Groq for each written type separately with its exact question range
-      for (const backendType of writtenTypes) {
-        const groqExamType = backendType === 'truefalse' ? 'true_or_false' : backendType;
-        const allQsForType = writtenQuestions[backendType];
-        // FIX: For T/F, always run Groq even if Tesseract filled all slots —
-        // Tesseract fills T/F with wrong "T" values, blankQs would be empty
-        // and we'd skip Groq, leaving all wrong answers in place.
-        const blankQs = allQsForType.filter(q => !answers[String(q)]);
-        const isTrueFalseType = backendType === 'truefalse';
-        // FIX: Also always run Groq for enumeration — Tesseract garbles handwritten
-        // enumeration answers badly (e.g. "c 5 5" instead of "CSS", "05 ..." instead
-        // of actual answers). Groq vision reads them correctly.
-        const isEnumerationType = backendType === 'enumeration';
-        if (blankQs.length === 0 && !isTrueFalseType && !isEnumerationType) continue; // skip only when all filled AND not T/F or enumeration
-        const fromQ = Math.min(...allQsForType);
-        const toQ   = Math.max(...allQsForType);
-
-        console.log(`[AutoChecker] Mixed Groq fill — ${blankQs.length} blanks for ${backendType} (Q${fromQ}-Q${toQ})`);
-        try {
-          // Pass fromQ/toQ so Groq only reads the correct section of the paper
-          const groqResult = await scanWithGroq(imageBase64, mimeType, groqExamType, questionCount, fromQ, toQ);
-          if (groqResult) {
-            for (const q of allQsForType) {
-              const k = String(q);
-              // FIX: For T/F AND enumeration, Groq overwrites ALL answers because
-              // Tesseract is systematically wrong for these types:
-              //   - T/F: Tesseract reads F as T consistently
-              //   - enumeration: Tesseract garbles written words badly (e.g. "c 5 5", "05 ...")
-              // For identification, only fill blanks Tesseract missed.
-              const shouldOverwrite = backendType === 'truefalse' || backendType === 'enumeration' || !answers[k];
-              if (shouldOverwrite && groqResult.answers[k]) {
-                answers[k] = groqResult.answers[k];
-              }
-            }
-          }
-        } catch (groqErr) {
-          console.warn('[AutoChecker] Mixed Groq fill failed (non-fatal):', groqErr.message);
+        // Build a section-aware description of what each question range expects
+        const sectionDescs = [];
+        if (mcQuestions.length > 0) {
+          const mf = Math.min(...mcQuestions), mt = Math.max(...mcQuestions);
+          sectionDescs.push(`Q${mf}-Q${mt}: MULTIPLE CHOICE — student wrote a single handwritten letter (A/B/C/D) on the blank line before the question number. IGNORE printed choices like "A. HTML  B. CSS". Return ONLY the handwritten letter.`);
         }
+        for (const backendType of writtenTypes) {
+          const qs = writtenQuestions[backendType];
+          const wf = Math.min(...qs), wt = Math.max(...qs);
+          if (backendType === 'truefalse') {
+            sectionDescs.push(`Q${wf}-Q${wt}: TRUE OR FALSE — student wrote T or F on the blank line before the question. T = top bar only. F = top bar + middle bar. Return "True" or "False". Empty blank = "".`);
+          } else if (backendType === 'identification') {
+            sectionDescs.push(`Q${wf}-Q${wt}: IDENTIFICATION — student wrote a word or short phrase on the blank line. IGNORE the printed question text after the blank. Return only the handwritten answer.`);
+          } else if (backendType === 'enumeration') {
+            sectionDescs.push(`Q${wf}-Q${wt}: ENUMERATION — student wrote a word or short phrase on each numbered blank. Common IT answers: HTML, CSS, JavaScript, Node.js, PHP, Python, MySQL, MongoDB, PostgreSQL, Git, React, API, JSON. Return the handwritten word only.`);
+          }
+        }
+
+        const combinedPrompt = `You are an expert at reading Filipino school exam papers with handwritten student answers.
+
+THIS PAGE HAS ${questionCount} QUESTIONS in multiple sections:
+
+${sectionDescs.join('\n\n')}
+
+GENERAL RULES:
+- The paper has TWO kinds of text: PRINTED (ignore) and HANDWRITTEN by student (read this).
+- Handwritten answers appear on blank lines (___) near the question number.
+- If a blank is empty, return "".
+- NEVER guess — if unreadable, return "".
+- For student name at the top, include "studentName":"Name".
+
+OUTPUT FORMAT: Return ONLY a valid JSON object with question numbers as keys.
+{"1":"answer","2":"answer",...,"${questionCount}":"answer"}`;
+
+        console.log(`[AutoChecker] Mixed Groq combined — single call for all ${questionCount} questions (Q${fromQ}-Q${toQ})`);
+
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method:  'POST',
+          headers: {
+            'Authorization': `Bearer ${GROQ_API_KEY}`,
+            'Content-Type':  'application/json',
+          },
+          body: JSON.stringify({
+            model:      'meta-llama/llama-4-scout-17b-16e-instruct',
+            max_tokens: 1000,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text',      text: combinedPrompt },
+                { type: 'image_url', image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${imageBase64}` } },
+              ],
+            }],
+          }),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Groq API error ${response.status}: ${errText.slice(0, 120)}`);
+        }
+
+        const data    = await response.json();
+        const rawText = (data.choices?.[0]?.message?.content ?? '').trim();
+        console.log(`[Groq Combined] Raw preview: ${rawText.slice(0, 300)}`);
+
+        const jsonText = rawText.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/,'').trim();
+        let parsed;
+        try {
+          parsed = JSON.parse(jsonText);
+        } catch {
+          const m = jsonText.match(/\{[\s\S]*\}/);
+          if (m) parsed = JSON.parse(m[0]);
+          else throw new Error('Could not parse combined Groq response');
+        }
+
+        const studentNameGroq = parsed.studentName ?? null;
+        if (studentNameGroq) delete parsed.studentName;
+
+        let groqFilled = 0;
+        for (let q = fromQ; q <= toQ; q++) {
+          const k   = String(q);
+          const val = (parsed[k] ?? parsed[q] ?? '').trim();
+          if (!val) continue;
+
+          const backendType = questionTypeMap[k];
+          const isMcQ = backendType === 'mc' || backendType === 'omr' || backendType === 'bubble_omr';
+
+          if (isMcQ) {
+            // Validate: must be A/B/C/D only
+            const upper = val.toUpperCase();
+            if (['A','B','C','D'].includes(upper)) {
+              answers[k] = upper;
+              groqFilled++;
+            }
+          } else if (backendType === 'truefalse') {
+            const lower = val.toLowerCase();
+            if (lower === 't' || lower === 'true')  { answers[k] = 'True';  groqFilled++; }
+            else if (lower === 'f' || lower === 'false') { answers[k] = 'False'; groqFilled++; }
+          } else {
+            // identification / enumeration — overwrite Tesseract (it garbles these)
+            answers[k] = val;
+            groqFilled++;
+          }
+        }
+
+        console.log(`[Groq Combined] Done — filled/verified ${groqFilled}/${questionCount} answers`);
+        if (studentNameGroq) {
+          // bubble up student name if Groq found it
+          answers['__studentName__'] = studentNameGroq;
+        }
+
+      } catch (groqErr) {
+        console.warn('[AutoChecker] Combined Groq call failed (non-fatal), keeping Tesseract results:', groqErr.message);
       }
+    }
+
+    // Extract student name stored by combined Groq call, then remove from answers map
+    const groqStudentName = answers['__studentName__'] ?? null;
+    delete answers['__studentName__'];
+    const resolvedStudentName = groqStudentName ?? studentName;
+
+    // Re-fill any blanks left after Groq (safety net)
+    for (let i = 1; i <= questionCount; i++) {
+      if (!answers[String(i)]) answers[String(i)] = '';
     }
 
     const finalAnsweredCount = Object.values(answers).filter(a => a !== '').length;
     const finalFillRate      = questionCount > 0 ? finalAnsweredCount / questionCount : 0;
     const confidence         = Math.min((engineConfidence / 100) * 0.6 + finalFillRate * 0.4, 1.0);
-    console.log(`[AutoChecker] Mixed-mode final — answered: ${finalAnsweredCount}/${questionCount}, confidence: ${(confidence * 100).toFixed(1)}%`);
-    return { studentName, answers, answeredCount: finalAnsweredCount, engineConfidence, confidence };
+    console.log('[AutoChecker] Mixed-mode final — answered: ' + finalAnsweredCount + '/' + questionCount + ', confidence: ' + (confidence * 100).toFixed(1) + '%');
+    return { studentName: resolvedStudentName, answers, answeredCount: finalAnsweredCount, engineConfidence, confidence };
   }
 
   // ── v3.0: Written types → Groq FIRST (much better at messy handwriting) ───
