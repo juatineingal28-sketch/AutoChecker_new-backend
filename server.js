@@ -1154,11 +1154,52 @@ try {
   console.warn('              Fix: npm install jimp');
 }
 
-// ── Layout constants — MUST stay in sync with omrImageProcessor.ts ────────────
+// ── Layout constants — derived from omrConfig.ts design constants ─────────────
+//
+// All fractions are relative to the PERSPECTIVE-CORRECTED image (page fills frame).
+// After warpPerspective(), the full image = the full A4 page, so these fractions
+// match the CSS pixel layout of the sheet at A4 @ 96 dpi (794 × 1123 px).
+//
+// Derivation (all values from omrConfig.ts):
+//   PAGE_W=794, PAGE_H=1123
+//   PAPER_PAD=12, REG_HALO=3, REG_SIZE=24, REG_MARGIN=6
+//   OUTER_PAD = REG_HALO + REG_SIZE + REG_MARGIN = 33
+//   gridLeft = PAPER_PAD + OUTER_PAD = 45
+//   HEADER_HEIGHT_PX=100 (header block measured from rendered sheet)
+//   gridTop  = PAPER_PAD + HEADER_HEIGHT + OUTER_PAD = 145
+//   COL_HEADER_H=20, BUBBLE_GAP=6, BUBBLE_MARGIN=4
+//
+//   GRID_TOP  = gridTop / PAGE_H = 145/1123 = 0.1291
+//   ROW_STEP  = ROW_H / PAGE_H
+//   BUBBLE_R  = (BUBBLE_W/2) / PAGE_W
+//   BUBBLE_STEP = (BUBBLE_W + BUBBLE_GAP) / PAGE_W = (18+6)/794 = 0.0302
+//
+//   COL_LEFT[col] = (gridLeft + col*(colInnerW+COL_SEP_W)) / PAGE_W
+//     where colInnerW = (PAGE_W - gridLeft*2 - COL_SEP_W*(numCols-1)) / numCols
+//
+//   Q_NUM_W = (COL_PAD_H + qNumW + BUBBLE_MARGIN + BUBBLE_W/2) / PAGE_W
+//             (distance from column left edge to first bubble centre)
+//
+// To re-calibrate if the sheet layout changes:
+//   1. Update HEADER_HEIGHT_PX to match the rendered header (print & measure)
+//   2. Run: node -e "const PH=1123,PW=794,PAD=12,OPD=33,HDRH=<new>; console.log((PAD+HDRH+OPD)/PH)"
+//   3. Update GRID_TOP with the result
 const OMR_LAYOUT = {
-  1: { GRID_TOP: 0.235, ROW_STEP: 0.033, BUBBLE_R: 0.038, COL_LEFT: [0.02],               Q_NUM_W: 0.065, BUBBLE_STEP: 0.105 },
-  2: { GRID_TOP: 0.235, ROW_STEP: 0.033, BUBBLE_R: 0.038, COL_LEFT: [0.02, 0.52],          Q_NUM_W: 0.065, BUBBLE_STEP: 0.105 },
-  3: { GRID_TOP: 0.235, ROW_STEP: 0.028, BUBBLE_R: 0.028, COL_LEFT: [0.01, 0.345, 0.675], Q_NUM_W: 0.050, BUBBLE_STEP: 0.072 },
+  // 1-column (≤25 questions): qNumW=36, ROW_H=30, BUBBLE=18×18
+  1: { GRID_TOP: 0.1291, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
+       COL_LEFT: [0.0567],
+       Q_NUM_W: 0.0693, BUBBLE_STEP: 0.0302 },
+
+  // 2-column (26–50 questions): qNumW=34, ROW_H=30, BUBBLE=18×18
+  2: { GRID_TOP: 0.1291, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
+       COL_LEFT: [0.0567, 0.5006],
+       Q_NUM_W: 0.0668, BUBBLE_STEP: 0.0302 },
+
+  // 3-column (51–100 questions): qNumW=30, ROW_H=30 (75Q) / 24 (100Q), BUBBLE=18×18 / 14×14
+  // ROW_STEP and BUBBLE_R use the 75Q values; 100Q sheets should set totalQ=100 explicitly.
+  3: { GRID_TOP: 0.1291, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
+       COL_LEFT: [0.0567, 0.3526, 0.6486],
+       Q_NUM_W: 0.0617, BUBBLE_STEP: 0.0302 },
 };
 
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
@@ -1386,7 +1427,7 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
       const cy = Math.round(layout.GRID_TOP * H + row * rowStep + rowStep * 0.5);
       allRatios[qNum] = OPTIONS.map((_, i) => {
         const cx = Math.round(bubbleX0 + i * layout.BUBBLE_STEP * W);
-        return sampleCircle(gray, W, H, cx, cy, r, darkThreshold);
+        return sampleCircleAdaptive(gray, W, H, cx, cy, r); // FIX: per-bubble adaptive threshold (was global Otsu)
       });
     }
   }
