@@ -1186,18 +1186,18 @@ try {
 //   3. Update GRID_TOP with the result
 const OMR_LAYOUT = {
   // 1-column (≤25 questions): qNumW=36, ROW_H=30, BUBBLE=18×18
-  1: { GRID_TOP: 0.1291, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
+  1: { GRID_TOP: 0.1808, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
        COL_LEFT: [0.0567],
        Q_NUM_W: 0.0693, BUBBLE_STEP: 0.0302 },
 
   // 2-column (26–50 questions): qNumW=34, ROW_H=30, BUBBLE=18×18
-  2: { GRID_TOP: 0.1291, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
+  2: { GRID_TOP: 0.1808, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
        COL_LEFT: [0.0567, 0.5006],
        Q_NUM_W: 0.0668, BUBBLE_STEP: 0.0302 },
 
   // 3-column (51–100 questions): qNumW=30, ROW_H=30 (75Q) / 24 (100Q), BUBBLE=18×18 / 14×14
   // ROW_STEP and BUBBLE_R use the 75Q values; 100Q sheets should set totalQ=100 explicitly.
-  3: { GRID_TOP: 0.1291, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
+  3: { GRID_TOP: 0.1808, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
        COL_LEFT: [0.0567, 0.3526, 0.6486],
        Q_NUM_W: 0.0617, BUBBLE_STEP: 0.0302 },
 };
