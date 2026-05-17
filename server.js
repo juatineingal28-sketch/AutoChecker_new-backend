@@ -1396,6 +1396,32 @@ const idealTR = { x: TARGET_W - MARK_INSET,  y: MARK_INSET };
 const idealBR = { x: TARGET_W - MARK_INSET,  y: TARGET_H - MARK_INSET };
 const idealBL = { x: MARK_INSET,             y: TARGET_H - MARK_INSET };
 
+// ── Corner fiducial blob detection ──────────────────────────────────────────
+// Search each corner quadrant for the darkest connected blob (registration mark).
+// Uses a simple connected-component approach: scan a small search region near
+// each corner, find pixels darker than the local threshold, then compute centroid.
+function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, darkThr) {
+  let sumX = 0, sumY = 0, count = 0;
+  for (let y = searchY0; y < searchY1; y++) {
+    for (let x = searchX0; x < searchX1; x++) {
+      if (grayArr[y * W + x] < darkThr) { sumX += x; sumY += y; count++; }
+    }
+  }
+  if (count < 4) return null; // not enough dark pixels — mark absent
+  return { cx: sumX / count, cy: sumY / count };
+}
+
+// Search region: 8% of image dimensions inward from each corner
+const searchW = Math.round(imgW * 0.10);
+const searchH = Math.round(imgH * 0.10);
+const cornerThr = Math.min(otsuThreshold(gray) * 0.75, 100); // dark registration marks
+
+const tlBlob = findCornerBlob(gray, imgW, imgH, 0, 0, searchW, searchH, cornerThr);
+const trBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, 0, imgW, searchH, cornerThr);
+const brBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, imgH - searchH, imgW, imgH, cornerThr);
+const blBlob = findCornerBlob(gray, imgW, imgH, 0, imgH - searchH, searchW, imgH, cornerThr);
+console.log(`[BubbleOMR] Corner blobs — TL:${tlBlob?'✓':'✗'} TR:${trBlob?'✓':'✗'} BR:${brBlob?'✓':'✗'} BL:${blBlob?'✓':'✗'}`);
+
 if (tlBlob && trBlob && brBlob && blBlob) {
   console.log(`[BubbleOMR] Perspective correction — corners TL(${tlBlob.cx.toFixed(0)},${tlBlob.cy.toFixed(0)}) TR(${trBlob.cx.toFixed(0)},${trBlob.cy.toFixed(0)}) BR(${brBlob.cx.toFixed(0)},${brBlob.cy.toFixed(0)}) BL(${blBlob.cx.toFixed(0)},${blBlob.cy.toFixed(0)})`);
   
@@ -1537,6 +1563,29 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   // Per-type instructions — explicitly distinguish printed text from handwritten answers.
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
+
+    bubble_omr: `This is a BUBBLE SHEET (OMR) exam. The student filled in circles/bubbles to indicate their answers.
+
+HOW TO READ A BUBBLE SHEET:
+- Each question row has 4 circles labeled A, B, C, D (left to right).
+- A FILLED bubble = the student's answer. It appears DARKENED, SHADED, or FILLED IN with pen/pencil.
+- An EMPTY bubble = not chosen. It is just an outline circle with a white/light interior.
+- Look for the circle that is darkest / most filled compared to the other 3 in that row.
+- A bubble can be filled with pencil (gray), ballpen (dark), or marker (solid black).
+
+COMMON PATTERNS:
+- Fully filled circle (solid black/dark) = chosen answer
+- Circle with an X or checkmark inside = chosen answer  
+- Heavy pencil shading inside circle = chosen answer
+- Light outline only = NOT chosen
+- Partially erased but still darker than empty = may be chosen (use darkest in row)
+
+COLUMNS: The sheet may have 2 columns side by side (e.g. Q1-Q25 on left, Q26-Q50 on right).
+Read each column top to bottom, then proceed to the next column.
+
+Return ONLY the letter (A, B, C, or D) of the FILLED bubble for each question.
+If NO bubble is clearly filled for a question, return "".
+NEVER guess — only return a letter if one bubble is visibly darker than the other 3.`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -1696,7 +1745,7 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
     }
 
     // Post-validate MC: Groq must only return A/B/C/D — reject anything else
-    if (examType === 'multiple_choice') {
+    if (examType === 'multiple_choice' || examType === 'bubble_omr' || examType === 'bubble_mc' || examType === 'omr') {
       for (const k of Object.keys(answers)) {
         const v = answers[k].trim().toUpperCase();
         answers[k] = ['A', 'B', 'C', 'D'].includes(v) ? v : '';
@@ -1764,22 +1813,26 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice' || examType === 'mc';
   const isWritten = !isMcType;
 
-  // ── Route bubble_omr to Jimp pixel detector first ───────────────────────
- // ── Route bubble_omr to Groq vision (most accurate for bubble sheets) ──
+  // ── Route bubble_omr to Groq vision (most accurate for bubble sheets) ──
 if (isBubble) {
   try {
     const groqResult = await scanWithGroq(imageBase64, mimeType, 'bubble_omr', questionCount);
     if (groqResult && groqResult.answeredCount > 0) {
-      console.log('[AutoChecker] Groq bubble read successful');
+      console.log(`[AutoChecker] Groq bubble read successful — ${groqResult.answeredCount}/${questionCount} bubbles detected`);
       return groqResult;
     }
+    console.warn(`[AutoChecker] Groq bubble scan returned 0 answers — trying Jimp pixel detector`);
   } catch (err) {
     console.warn('[AutoChecker] Groq bubble detection failed:', err.message);
   }
-  // Jimp fallback
+  // Jimp pixel-detection fallback
   try {
     const jimpResult = await detectBubblesWithJimp(imageBase64, mimeType, questionCount);
-    if (jimpResult) return jimpResult;
+    if (jimpResult && jimpResult.answeredCount > 0) {
+      console.log(`[AutoChecker] Jimp bubble detection successful — ${jimpResult.answeredCount}/${questionCount} bubbles detected`);
+      return jimpResult;
+    }
+    console.warn('[AutoChecker] Jimp bubble detection returned 0 answers — falling back to Tesseract');
   } catch (err) {
     console.warn('[AutoChecker] Jimp bubble detection failed:', err.message);
   }
