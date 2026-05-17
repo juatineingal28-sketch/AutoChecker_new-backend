@@ -1364,39 +1364,58 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
   }
 
   image.greyscale();
-  const W = image.getWidth();
-  const H = image.getHeight();
+let imgW = image.getWidth();
+let imgH = image.getHeight();
 
-  // Build flat grayscale array
-  let gray = new Uint8Array(W * H);
-  for (let py = 0; py < H; py++) {
-    for (let px = 0; px < W; px++) {
-      gray[py * W + px] = Jimp.intToRGBA(image.getPixelColor(px, py)).r;
+// Build flat grayscale array
+let gray = new Uint8Array(imgW * imgH);
+for (let py = 0; py < imgH; py++) {
+  for (let px = 0; px < imgW; px++) {
+    gray[py * imgW + px] = Jimp.intToRGBA(image.getPixelColor(px, py)).r;
+  }
+}
+
+// Canonical A4 dimensions — all layout fractions are relative to this
+const TARGET_W = 794;
+const TARGET_H = 1123;
+
+// ── Perspective correction via corner fiducials ──────────────────────────
+const CORNER_FRAC = 0.12;
+const cW = Math.floor(CORNER_FRAC * imgW);
+const cH = Math.floor(CORNER_FRAC * imgH);
+const cornerDarkT = 80;
+
+const tlBlob = findDarkBlob(gray, imgW, imgH,        0,        0,   cW,   cH, cornerDarkT);
+const trBlob = findDarkBlob(gray, imgW, imgH, imgW - cW,        0, imgW,   cH, cornerDarkT);
+const brBlob = findDarkBlob(gray, imgW, imgH, imgW - cW, imgH - cH, imgW, imgH, cornerDarkT);
+const blBlob = findDarkBlob(gray, imgW, imgH,        0, imgH - cH,   cW, imgH, cornerDarkT);
+
+if (tlBlob && trBlob && brBlob && blBlob) {
+  console.log(`[BubbleOMR] Perspective correction — corners TL(${tlBlob.cx.toFixed(0)},${tlBlob.cy.toFixed(0)}) TR(${trBlob.cx.toFixed(0)},${trBlob.cy.toFixed(0)}) BR(${brBlob.cx.toFixed(0)},${brBlob.cy.toFixed(0)}) BL(${blBlob.cx.toFixed(0)},${blBlob.cy.toFixed(0)})`);
+  // Warp directly to canonical 794×1123 so layout fractions are exact
+  gray = perspectiveWarp(gray, imgW, imgH, [tlBlob, trBlob, brBlob, blBlob], TARGET_W, TARGET_H);
+  imgW = TARGET_W;
+  imgH = TARGET_H;
+  console.log(`[BubbleOMR] Perspective correction applied ✓ — output: ${imgW}×${imgH}`);
+} else {
+  const found = [tlBlob, trBlob, brBlob, blBlob].filter(Boolean).length;
+  console.warn(`[BubbleOMR] Perspective correction skipped — only ${found}/4 corners detected`);
+  // Resize to canonical dimensions anyway so fractions still work
+  const resized = new Uint8Array(TARGET_W * TARGET_H);
+  for (let ty = 0; ty < TARGET_H; ty++) {
+    for (let tx = 0; tx < TARGET_W; tx++) {
+      const sx = Math.min(imgW - 1, Math.round(tx * imgW / TARGET_W));
+      const sy = Math.min(imgH - 1, Math.round(ty * imgH / TARGET_H));
+      resized[ty * TARGET_W + tx] = gray[sy * imgW + sx];
     }
   }
+  gray = resized;
+  imgW = TARGET_W;
+  imgH = TARGET_H;
+}
 
-  // ── FIX 1: Perspective correction via corner fiducials ──────────────────
-  // Search for registration marks in the four 12% × 12% corner regions.
-  // The OMR sheet has solid dark squares / circles at each corner.
-  const CORNER_FRAC = 0.12;
-  const cW = Math.floor(CORNER_FRAC * W);
-  const cH = Math.floor(CORNER_FRAC * H);
-  const cornerDarkT = 80; // dark enough to be a registration mark
-
-  const tlBlob = findDarkBlob(gray, W, H,    0,     0,    cW,    cH, cornerDarkT);
-  const trBlob = findDarkBlob(gray, W, H, W-cW,     0,     W,    cH, cornerDarkT);
-  const brBlob = findDarkBlob(gray, W, H, W-cW, H-cH,     W,     H, cornerDarkT);
-  const blBlob = findDarkBlob(gray, W, H,    0, H-cH,    cW,     H, cornerDarkT);
-
-  if (tlBlob && trBlob && brBlob && blBlob) {
-    console.log(`[BubbleOMR] Perspective correction — corners TL(${tlBlob.cx.toFixed(0)},${tlBlob.cy.toFixed(0)}) TR(${trBlob.cx.toFixed(0)},${trBlob.cy.toFixed(0)}) BR(${brBlob.cx.toFixed(0)},${brBlob.cy.toFixed(0)}) BL(${blBlob.cx.toFixed(0)},${blBlob.cy.toFixed(0)})`);
-    const warped = perspectiveWarp(gray, W, H, [tlBlob, trBlob, brBlob, blBlob], W, H);
-    gray = warped; // replace with perspective-corrected pixels
-    console.log('[BubbleOMR] Perspective correction applied ✓');
-  } else {
-    const found = [tlBlob,trBlob,brBlob,blBlob].filter(Boolean).length;
-    console.warn(`[BubbleOMR] Perspective correction skipped — only ${found}/4 corners detected, using raw image`);
-  }
+const W = imgW;
+const H = imgH;
 
   // Otsu threshold on the grid area only (avoids white header skewing histogram)
   const gridY0    = Math.floor(layout.GRID_TOP * H);
