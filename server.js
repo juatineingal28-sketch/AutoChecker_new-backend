@@ -1298,49 +1298,59 @@ function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
 //
 // Implementation uses pure JS bilinear sampling so there is zero extra dependency.
 
-function findDarkBlob(gray, W, H, roiX0, roiY0, roiX1, roiY1, darkThreshold) {
-  // Returns { cx, cy } of the darkest blob centroid in the given ROI,
-  // or null if no sufficiently dark cluster is found.
-  let sumX = 0, sumY = 0, count = 0;
-  for (let py = roiY0; py < roiY1; py++) {
-    for (let px = roiX0; px < roiX1; px++) {
-      if (gray[py * W + px] < darkThreshold) {
-        sumX += px; sumY += py; count++;
-      }
+// Maps src 4 corners → dst 4 corners using full homography (replaces perspectiveWarp)
+function homographyWarp(srcGray, srcW, srcH, srcPts, dstPts, outW, outH) {
+  // Build 8×8 system: src corners → dst corners
+  const [s0,s1,s2,s3] = srcPts; // detected mark centres
+  const [d0,d1,d2,d3] = dstPts; // ideal mark centres on output canvas
+
+  const A = [], b = [];
+  const pairs = [[s0,d0],[s1,d1],[s2,d2],[s3,d3]];
+  for (const [s,d] of pairs) {
+    A.push([s.cx??s.x, s.cy??s.y, 1, 0, 0, 0, -(d.x)*(s.cx??s.x), -(d.x)*(s.cy??s.y)]);
+    A.push([0, 0, 0, s.cx??s.x, s.cy??s.y, 1, -(d.y)*(s.cx??s.x), -(d.y)*(s.cy??s.y)]);
+    b.push(d.x, d.y);
+  }
+
+  // Gaussian elimination to solve for homography h
+  const n = 8;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let maxRow = col;
+    for (let r = col+1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[maxRow][col])) maxRow = r;
+    [M[col], M[maxRow]] = [M[maxRow], M[col]];
+    if (Math.abs(M[col][col]) < 1e-10) return srcGray; // singular fallback
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col] / M[col][col];
+      for (let c = col; c <= n; c++) M[r][c] -= f * M[col][c];
     }
   }
-  if (count < 8) return null; // too few dark pixels — not a real mark
-  return { cx: sumX / count, cy: sumY / count };
-}
+  const h = new Float64Array(9);
+  for (let i = 0; i < 8; i++) h[i] = M[i][n] / M[i][i];
+  h[8] = 1;
 
-function perspectiveWarp(gray, W, H, srcPts, dstW, dstH) {
-  // srcPts: [TL, TR, BR, BL] as {x,y} in the original image.
-  // Maps a dstW×dstH output grid back to srcPts quadrilateral via inverse bilinear.
-  // Returns a new Uint8Array of size dstW×dstH.
+  // Invert H to map output pixels → source pixels
+  const [h0,h1,h2,h3,h4,h5,h6,h7,h8] = h;
+  const det = h0*(h4*h8-h5*h7) - h1*(h3*h8-h5*h6) + h2*(h3*h7-h4*h6);
+  if (Math.abs(det) < 1e-12) return srcGray;
+  const inv = new Float64Array(9);
+  inv[0]=(h4*h8-h5*h7)/det; inv[1]=(h2*h7-h1*h8)/det; inv[2]=(h1*h5-h2*h4)/det;
+  inv[3]=(h5*h6-h3*h8)/det; inv[4]=(h0*h8-h2*h6)/det; inv[5]=(h2*h3-h0*h5)/det;
+  inv[6]=(h3*h7-h4*h6)/det; inv[7]=(h1*h6-h0*h7)/det; inv[8]=(h0*h4-h1*h3)/det;
 
-  const [tl, tr, br, bl] = srcPts;
-
-  function srcCoord(u, v) {
-    // u,v in [0,1]; maps to source pixel via bilinear interpolation of corners.
-    const x = (1-v)*((1-u)*tl.x + u*tr.x) + v*((1-u)*bl.x + u*br.x);
-    const y = (1-v)*((1-u)*tl.y + u*tr.y) + v*((1-u)*bl.y + u*br.y);
-    return { x, y };
-  }
-
-  const out = new Uint8Array(dstW * dstH);
-  for (let dy = 0; dy < dstH; dy++) {
-    const v = dy / (dstH - 1);
-    for (let dx = 0; dx < dstW; dx++) {
-      const u = dx / (dstW - 1);
-      const { x, y } = srcCoord(u, v);
-      // Bilinear sample
-      const x0 = Math.max(0, Math.min(W - 2, Math.floor(x)));
-      const y0 = Math.max(0, Math.min(H - 2, Math.floor(y)));
-      const fx = x - x0, fy = y - y0;
-      const v00 = gray[y0*W + x0], v10 = gray[y0*W + x0+1];
-      const v01 = gray[(y0+1)*W + x0], v11 = gray[(y0+1)*W + x0+1];
-      out[dy * dstW + dx] = Math.round(
-        (1-fy)*((1-fx)*v00 + fx*v10) + fy*((1-fx)*v01 + fx*v11)
+  const out = new Uint8Array(outW * outH);
+  for (let dy = 0; dy < outH; dy++) {
+    for (let dx = 0; dx < outW; dx++) {
+      const w2 = inv[6]*dx + inv[7]*dy + inv[8];
+      const sx = (inv[0]*dx + inv[1]*dy + inv[2]) / w2;
+      const sy = (inv[3]*dx + inv[4]*dy + inv[5]) / w2;
+      const x0 = Math.max(0, Math.min(srcW-2, Math.floor(sx)));
+      const y0 = Math.max(0, Math.min(srcH-2, Math.floor(sy)));
+      const fx = sx-x0, fy = sy-y0;
+      out[dy*outW+dx] = Math.round(
+        (1-fy)*((1-fx)*srcGray[y0*srcW+x0] + fx*srcGray[y0*srcW+x0+1]) +
+        fy*((1-fx)*srcGray[(y0+1)*srcW+x0] + fx*srcGray[(y0+1)*srcW+x0+1])
       );
     }
   }
@@ -1378,29 +1388,27 @@ for (let py = 0; py < imgH; py++) {
 // Canonical A4 dimensions — all layout fractions are relative to this
 const TARGET_W = 794;
 const TARGET_H = 1123;
+const MARK_INSET = 27; // MARK_CENTRE_FROM_PAPER_EDGE_PX from omrConfig
 
-// ── Perspective correction via corner fiducials ──────────────────────────
-const CORNER_FRAC = 0.12;
-const cW = Math.floor(CORNER_FRAC * imgW);
-const cH = Math.floor(CORNER_FRAC * imgH);
-const cornerDarkT = 80;
-
-const tlBlob = findDarkBlob(gray, imgW, imgH,        0,        0,   cW,   cH, cornerDarkT);
-const trBlob = findDarkBlob(gray, imgW, imgH, imgW - cW,        0, imgW,   cH, cornerDarkT);
-const brBlob = findDarkBlob(gray, imgW, imgH, imgW - cW, imgH - cH, imgW, imgH, cornerDarkT);
-const blBlob = findDarkBlob(gray, imgW, imgH,        0, imgH - cH,   cW, imgH, cornerDarkT);
+// Warp corners to their IDEAL positions (not full canvas edges)
+const idealTL = { x: MARK_INSET,             y: MARK_INSET };
+const idealTR = { x: TARGET_W - MARK_INSET,  y: MARK_INSET };
+const idealBR = { x: TARGET_W - MARK_INSET,  y: TARGET_H - MARK_INSET };
+const idealBL = { x: MARK_INSET,             y: TARGET_H - MARK_INSET };
 
 if (tlBlob && trBlob && brBlob && blBlob) {
   console.log(`[BubbleOMR] Perspective correction — corners TL(${tlBlob.cx.toFixed(0)},${tlBlob.cy.toFixed(0)}) TR(${trBlob.cx.toFixed(0)},${trBlob.cy.toFixed(0)}) BR(${brBlob.cx.toFixed(0)},${brBlob.cy.toFixed(0)}) BL(${blBlob.cx.toFixed(0)},${blBlob.cy.toFixed(0)})`);
-  // Warp directly to canonical 794×1123 so layout fractions are exact
-  gray = perspectiveWarp(gray, imgW, imgH, [tlBlob, trBlob, brBlob, blBlob], TARGET_W, TARGET_H);
+  
+  // Use homography: map detected corners → ideal positions on TARGET canvas
+  gray = homographyWarp(gray, imgW, imgH, 
+    [tlBlob, trBlob, brBlob, blBlob],
+    [idealTL, idealTR, idealBR, idealBL],
+    TARGET_W, TARGET_H);
   imgW = TARGET_W;
   imgH = TARGET_H;
   console.log(`[BubbleOMR] Perspective correction applied ✓ — output: ${imgW}×${imgH}`);
 } else {
-  const found = [tlBlob, trBlob, brBlob, blBlob].filter(Boolean).length;
-  console.warn(`[BubbleOMR] Perspective correction skipped — only ${found}/4 corners detected`);
-  // Resize to canonical dimensions anyway so fractions still work
+  // fallback resize
   const resized = new Uint8Array(TARGET_W * TARGET_H);
   for (let ty = 0; ty < TARGET_H; ty++) {
     for (let tx = 0; tx < TARGET_W; tx++) {
