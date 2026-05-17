@@ -1248,39 +1248,41 @@ function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
 const ADAPTIVE_BIAS = 0.18; // bubble must be 18% darker than local bg to count as filled
 
 function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
-  // Step 1: compute local background mean in 2.5× halo ring (excludes bubble interior)
-  const haloR  = Math.round(r * 2.5);
+  const haloR   = Math.round(r * 2.5);
   const innerR2 = r * r;
   const outerR2 = haloR * haloR;
+
+  // Step 1: local background mean (0-255 scale, NOT normalized)
   let bgSum = 0, bgCount = 0;
   for (let dy = -haloR; dy <= haloR; dy++) {
     for (let dx = -haloR; dx <= haloR; dx++) {
-      const d2 = dx*dx + dy*dy;
+      const d2 = dx * dx + dy * dy;
       if (d2 <= innerR2 || d2 > outerR2) continue;
       const px = cx + dx, py = cy + dy;
       if (px < 0 || px >= W || py < 0 || py >= H) continue;
-      bgSum += gray[py * W + px] / 255;
+      bgSum += gray[py * W + px];  // raw 0-255, no division
       bgCount++;
     }
   }
-  const localBg        = bgCount > 0 ? bgSum / bgCount : 0.85;
-  const localThreshold = Math.max(0.05, localBg - ADAPTIVE_BIAS);
+  const localBg = bgCount > 0 ? bgSum / bgCount : 220;  // default: white paper
 
-  // Step 2: count dark pixels inside the bubble circle
+  // Ink threshold: bubble must be 18% darker than local background (in 0-255 scale)
+  const localThreshold = Math.max(30, localBg * (1 - ADAPTIVE_BIAS));  // e.g. 220 * 0.82 = 180
+
+  // Step 2: count dark pixels inside bubble
   let dark = 0, total = 0;
   const r2 = r * r;
   for (let dy = -r; dy <= r; dy++) {
     for (let dx = -r; dx <= r; dx++) {
-      if (dx*dx + dy*dy > r2) continue;
+      if (dx * dx + dy * dy > r2) continue;
       const px = cx + dx, py = cy + dy;
       if (px < 0 || px >= W || py < 0 || py >= H) continue;
       total++;
-      if (gray[py * W + px] / 255 < localThreshold) dark++;
+      if (gray[py * W + px] < localThreshold) dark++;  // raw comparison, no division
     }
   }
   return total > 0 ? dark / total : 0;
 }
-
 // ─── FIX 1: Perspective correction via fiducial corner markers ───────────────
 //
 // Phone photos are almost never perfectly top-down. Even a 5° tilt causes the
