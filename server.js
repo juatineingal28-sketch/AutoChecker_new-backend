@@ -1765,15 +1765,26 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   const isWritten = !isMcType;
 
   // ── Route bubble_omr to Jimp pixel detector first ───────────────────────
-  if (isBubble) {
-    try {
-      const jimpResult = await detectBubblesWithJimp(imageBase64, mimeType, questionCount);
-      if (jimpResult) return jimpResult;
-    } catch (err) {
-      console.warn('[AutoChecker] Jimp bubble detection failed, falling back to Tesseract:', err.message);
+ // ── Route bubble_omr to Groq vision (most accurate for bubble sheets) ──
+if (isBubble) {
+  try {
+    const groqResult = await scanWithGroq(imageBase64, mimeType, 'bubble_omr', questionCount);
+    if (groqResult && groqResult.answeredCount > 0) {
+      console.log('[AutoChecker] Groq bubble read successful');
+      return groqResult;
     }
-    console.log('[AutoChecker] Falling back to Tesseract for bubble sheet...');
+  } catch (err) {
+    console.warn('[AutoChecker] Groq bubble detection failed:', err.message);
   }
+  // Jimp fallback
+  try {
+    const jimpResult = await detectBubblesWithJimp(imageBase64, mimeType, questionCount);
+    if (jimpResult) return jimpResult;
+  } catch (err) {
+    console.warn('[AutoChecker] Jimp bubble detection failed:', err.message);
+  }
+  console.log('[AutoChecker] Falling back to Tesseract for bubble sheet...');
+}
 
   // ── FIX: Mixed-mode path — run both OCR workers and extract per question range ──
   // When mixedMode=true and questionTypeMap is provided, we run the MC worker
