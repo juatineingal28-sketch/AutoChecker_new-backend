@@ -1190,87 +1190,92 @@ const TARGET_W   = 794;
 const TARGET_H   = 1123;
 const MARK_INSET = 27; // registration mark centre inset from paper edge (px)
 
-// ── OMR_LAYOUT — derived from omrConfig.ts + calibration scans ────────────────
+// ── OMR_LAYOUT — ground truth from omrImageProcessor.ts (v5) ─────────────────
 //
-// ALL values are fractions of the 794×1123 canonical A4 image.
+// ALL values are fractions of the 794×1123 canonical A4 image AFTER
+// perspective correction.  Derived directly from computeBubbleGrid() in
+// omrImageProcessor.ts — the frontend renderer is the single source of truth.
 //
-// Key derivation (omrConfig.ts constants):
-//   PAGE_W=794  PAGE_H=1123
-//   PAPER_PAD=12  REG_HALO=3  REG_SIZE=24  REG_MARGIN=6
-//   OUTER_PAD = 3+24+6 = 33
-//   gridLeft  = 12+33 = 45 px
+// omrImageProcessor.ts constants for 50Q (2-column):
+//   GRID_LEFT_OFFSET = 38 px     (replaces PAPER_PAD+OUTER_PAD = 45)
+//   HEADER_HEIGHT_PX = 155 px    (measured from printed sheet)
+//   OUTER_PAD_PX     = 33 px
+//   gridTop          = 155 + 33 = 188 px
+//   COL_HEADER_H     = 22 px
+//   rowH             = 30 px     (getRowHeightPx(50))
+//   qNumW            = 34 px     (getQNumWidthPx(50))
+//   bubbleW          = 18 px     (getBubbleWidthPx(50))
+//   bubbleH          = 18 px     (getBubbleHeightPx(50))
+//   BUBBLE_GAP       = 8 px      (was 6 in old config — KEY CHANGE)
+//   BUBBLE_MARGIN    = 2 px      (was 4 in old config)
+//   COL_PAD_H        = 6 px
+//   COL_SEP_W        = 1 px
 //
-// Header height derived from actual rendered sheet measurement = 155px
-//   GRID_TOP  = (12 + 155 + 33) / 1123 = 200/1123 = 0.1780
+// Derived pixel positions (scale=1.0, 794×1123):
+//   gridLeft         = 38 px
+//   singleColInnerW  = (794 - 38*2 - 1) / 2 = 358.5 px
+//   bubbleStep       = (18 + 8) * 1.0 = 26 px
 //
-// Row pitch: each row = BUBBLE_H(18) + ROW_GAP(12) = 30px
-//   ROW_STEP  = 30/1123 = 0.0267  ← unchanged, matches render
+//   Col0 colContentLeft = 38 px
+//   Col0 bubbleX0 (A)   = 38 + (6+34+2)*1 + 9*1 = 38 + 42 + 9 = 89 px
+//   Col0 centres: A=89  B=115  C=141  D=167  px
 //
-// BUBBLE geometry (omrConfig.ts): BUBBLE_W=18  BUBBLE_GAP=6
-//   BUBBLE_STEP = (18+6)/794 = 24/794 = 0.0302
-//   BUBBLE_R    = 9/794 = 0.0113  ← radius = half bubble width (was 7px, too small)
+//   Col1 colContentLeft = 38 + 358.5 + 1 = 397.5 px
+//   Col1 bubbleX0 (A)   = 397.5 + 51 = 448.5 px
+//   Col1 centres: A=448 B=474  C=500  D=527  px
 //
-// Q_NUM_W: distance from column left edge (45px) to bubble-A centre.
-//   From omrConfig: COL_PAD_LEFT=8, Q_NUM_W_PX=30, BUBBLE_MARGIN=4, BUBBLE_W/2=9
-//   Q_NUM_W_TOTAL = 8 + 30 + 4 + 9 = 51px
-//   fraction = 51/794 = 0.0642
-//   → verified: bubble-A at 45+51=96px, B=120, C=144, D=168 (col0)
+//   firstRowCy (Q1) = 188 + 22 + 15 = 225 px
+//   Q2 cy = 255 px   Q3 = 285 px   Q25 = 945 px
 //
-// COL_LEFT for 2-column (50Q):
-//   colInnerW = (794 - 45*2 - COL_SEP_W) / 2
-//   COL_SEP_W = 20px (measured from render)
-//   colInnerW = (794 - 90 - 20) / 2 = 342px
-//   col0 left = 45/794 = 0.0567
-//   col1 left = (45 + 342 + 20)/794 = 407/794 = 0.5126
+// Server-side GRID_TOP formula: cy = GRID_TOP*H + row*ROW_STEP*H + 0.5*ROW_STEP*H
+//   For row=0 (Q1): 225 = GRID_TOP*1123 + 15  →  GRID_TOP = 210/1123 = 0.1870
 //
-// COL_LEFT for 3-column (100Q):
-//   colInnerW = (794-90-2*20)/3 = 221.3px
-//   col0 = 45/794=0.0567  col1=(45+221+20)/794=0.3600  col2=(45+2*221+2*20)/794=0.6634
+// Q_NUM_W formula in server.js: bubbleX0 = (COL_LEFT + Q_NUM_W) * W
+//   Col0: (0.0479 + Q_NUM_W) * 794 = 89  →  Q_NUM_W = (89-38)/794 = 51/794 = 0.0642
+//   Col1: (0.5006 + Q_NUM_W) * 794 = 448.5  →  Q_NUM_W = 51/794 = 0.0642  ✓
 //
-// CALIBRATION NOTE (v4, from scan logs showing C-bias):
-//   Q_NUM_W was previously 0.0491 (=39/794=84px from col-left).
-//   But the rendered sheet uses Q_NUM_OFFSET=51px → bubble-A at 96px.
-//   The old value placed A at 84px, B at 108px, C at 132px.
-//   Since actual A is at 96px but sampler assumed 84px, sampler landed:
-//     A→84px, B→108px, C→132px, D→156px  (old, wrong)
-//   Meanwhile actual bubbles are at:
-//     A=96px, B=120px, C=144px, D=168px  (real positions)
-//   So old B-sample hit actual A, old C-sample hit actual B, old D-sample → C.
-//   Result: sampler always selected C because its "C" coordinate matched actual B's
-//   fill zone, which happened to be the most-filled bubble in those test scans.
-//   Fix: use 0.0642 (=51/794).
+// BUBBLE_STEP = 26/794 = 0.0327
+//
+// BUBBLE_R: use full half-width of bubble = 9 px / 794 = 0.0113
+//   The adaptive threshold in sampleCircleAdaptive handles lighting variation —
+//   a larger radius gives more stable readings than the old 7px.
+//
+// 3-column (75–100Q): singleColInnerW = (794-38*2-2)/3 = 238.7px
+//   col0=38, col1=38+238.7+1=277.7, col2=38+2*239.7=517.4
+//   COL_LEFT: [0.0479, 0.3498, 0.6517]
 
 const OMR_LAYOUT = {
   // 1-column (≤25 questions)
+  // Col0 centres: A=89 B=115 C=141 D=167 px
   1: {
-    GRID_TOP:    0.1780,   // 200/1123 — first bubble-row centre from top
+    GRID_TOP:    0.1870,   // 210/1123 — anchors row-0 centre at Q1=225px
     ROW_STEP:    0.0267,   // 30/1123  — row pitch
-    BUBBLE_R:    0.0113,   // 9/794    — inner sampling radius (full bubble half-width)
-    COL_LEFT:    [0.0567], // 45/794
-    Q_NUM_W:     0.0642,   // 51/794   — col-left to bubble-A centre
-    BUBBLE_STEP: 0.0302,   // 24/794   — bubble-A to bubble-B pitch
+    BUBBLE_R:    0.0113,   // 9/794    — full bubble half-width
+    COL_LEFT:    [0.0479], // 38/794
+    Q_NUM_W:     0.0642,   // 51/794   — col-left-edge to bubble-A centre
+    BUBBLE_STEP: 0.0327,   // 26/794   — A→B centre pitch (bubbleW+BUBBLE_GAP=18+8)
   },
 
   // 2-column (26–50 questions)
-  // Col0 bubble centres: A=96 B=120 C=144 D=168 px
-  // Col1 bubble centres: A=503 B=527 C=551 D=575 px  (407+96=503)
+  // Col0 centres: A=89  B=115 C=141 D=167 px
+  // Col1 centres: A=448 B=474 C=500 D=527 px
   2: {
-    GRID_TOP:    0.1780,
+    GRID_TOP:    0.1870,
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0567, 0.5126],  // 45/794, 407/794
+    COL_LEFT:    [0.0479, 0.5006],  // 38/794, 397.5/794
     Q_NUM_W:     0.0642,
-    BUBBLE_STEP: 0.0302,
+    BUBBLE_STEP: 0.0327,
   },
 
   // 3-column (51–100 questions)
   3: {
-    GRID_TOP:    0.1780,
+    GRID_TOP:    0.1870,
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0567, 0.3600, 0.6634],
+    COL_LEFT:    [0.0479, 0.3498, 0.6517],
     Q_NUM_W:     0.0642,
-    BUBBLE_STEP: 0.0302,
+    BUBBLE_STEP: 0.0327,
   },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
@@ -1566,7 +1571,10 @@ const H = imgH;
   // FIXED: was 1.5 — too strict for lightly filled bubbles.
   // 1.3 means the filled bubble only needs to be 30% darker than the next-darkest.
   const MIN_RATIO = 1.3;
-  const marginThreshold = Math.max(0.06, Math.min(0.20, baselineStd * 1.5)); // kept for DOUBLE MARK detection
+  // FIXED: double-mark detection margin. Was dynamic (baselineStd*1.5, min 0.06) which
+  // was too loose — it flagged Q1/Q23/Q25 as double-marked when they were just noisy.
+  // Now require the top-2 bubbles to be within 0.03 of each other AND both above threshold.
+  const marginThreshold = 0.03;
   console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} minRatio=${MIN_RATIO}×`);
 
   // Classify each question
@@ -2842,7 +2850,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '4.0-omr-accuracy-fix',
+  version: '5.0-omr-ground-truth-fix',
 }));
 
 // Error handler
@@ -2864,4 +2872,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260518-omr-accuracy-fix-v4
+// redeploy-trigger-20260518-omr-ground-truth-v5
