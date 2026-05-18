@@ -1186,14 +1186,23 @@ try {
 //   3. Update GRID_TOP with the result
 const OMR_LAYOUT = {
   // 1-column (≤25 questions)
+  // GRID_TOP: fraction from top of image to first bubble-row slot (includes col header)
+  // ROW_STEP: fraction of image height per row = rowH(30px) / 1123
+  // BUBBLE_R: sampling radius = bubbleH/2 / page_width = 7/794
+  // Q_NUM_W: fraction from col-left-edge to bubble-A centre = (COL_PAD_H+qNumW+BUBBLE_MARGIN+bubbleW/2)/794
+  // BUBBLE_STEP: centre-to-centre between A→B→C→D = (bubbleW+BUBBLE_GAP)/794 = (18+6)/794
   1: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
        COL_LEFT: [0.0567],
-       Q_NUM_W: 0.0693, BUBBLE_STEP: 0.0302 },
+       Q_NUM_W: 0.0641, BUBBLE_STEP: 0.0302 },
 
-  // 2-column (26–50 questions)
-  2: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
+  // 2-column (26–50 questions) — calibrated to AutoChecker A4 sheet
+  // col0 left = 45/794 = 0.0567
+  // col1 left = (45 + 351.5 + 1)/794 = 397.5/794 = 0.5006
+  // Q_NUM_W = (6 + 34 + 2 + 9)/794 = 51/794 = 0.0642
+  // BUBBLE_STEP = (18+6)/794 = 24/794 = 0.0302
+  2: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0088,
        COL_LEFT: [0.0567, 0.5006],
-       Q_NUM_W: 0.0668, BUBBLE_STEP: 0.0302 },
+       Q_NUM_W: 0.0642, BUBBLE_STEP: 0.0302 },
 
   // 3-column (51–100 questions)
   3: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
@@ -1245,7 +1254,7 @@ function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
 // Solution: for each bubble, sample a larger surrounding halo (2.5× radius)
 // to compute a LOCAL background mean, then threshold relative to that.
 // This makes each bubble's fill decision independent of global lighting.
-const ADAPTIVE_BIAS = 0.18; // bubble must be 18% darker than local bg to count as filled
+const ADAPTIVE_BIAS = 0.12; // bubble must be 12% darker than local bg to count as filled (was 18% — too strict for ballpen)
 
 function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
   const haloR   = Math.round(r * 2.5);
@@ -1489,14 +1498,12 @@ const H = imgH;
   const minRatios    = Object.values(allRatios).map(r4 => Math.min(...r4));
   const baselineMean = minRatios.reduce((s, v) => s + v, 0) / minRatios.length;
   const baselineStd  = Math.sqrt(minRatios.reduce((s, v) => s + (v - baselineMean) ** 2, 0) / minRatios.length);
-  const fillThreshold   = Math.max(0.20, Math.min(0.65, baselineMean + 3.0 * baselineStd));
+  const fillThreshold   = Math.max(0.12, Math.min(0.55, baselineMean + 2.5 * baselineStd));
 
   // ── FIX 2: Relative threshold (max/secondMax ratio) instead of fixed margin ──
-  // Fixed margin threshold (best - second >= 0.08) fails when the overall fill
-  // level is low (faint pencil) or very high (heavy ballpen). A ratio test is
-  // scale-invariant: the filled bubble must be at least 2× darker than the
-  // next-darkest bubble, regardless of absolute ink level.
-  const MIN_RATIO = 2.0; // filled must be ≥ 2× second-best to be unambiguous
+  // Lower MIN_RATIO from 2.0 → 1.5 so lightly-filled bubbles are still detected.
+  // A filled bubble still needs to be clearly darker than the next-darkest in the row.
+  const MIN_RATIO = 1.5;
   const marginThreshold = Math.max(0.06, Math.min(0.20, baselineStd * 1.5)); // kept for DOUBLE MARK detection
   console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} minRatio=${MIN_RATIO}×`);
 
@@ -1564,35 +1571,28 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
 
-    bubble_omr: `You are reading an AutoChecker BUBBLE ANSWER SHEET. Follow these rules EXACTLY.
+    bubble_omr: `This is a BUBBLE SHEET (OMR) exam. The student filled in circles/bubbles to indicate their answers.
 
-SHEET LAYOUT:
-- The sheet has TWO columns of questions side by side separated by a vertical line.
-- LEFT column: questions 1–25 (top to bottom).
-- RIGHT column: questions 26–50 (top to bottom).
-- Each column has a header row showing: A  B  C  D  (these are column labels, NOT answers).
-- Below the header, each question row shows: [row number]  ○  ○  ○  ○
-  The four circles correspond to A (leftmost), B, C, D (rightmost) — in that exact order.
+HOW TO READ A BUBBLE SHEET:
+- Each question row has 4 circles labeled A, B, C, D (left to right).
+- A FILLED bubble = the student's answer. It appears DARKENED, SHADED, or FILLED IN with pen/pencil.
+- An EMPTY bubble = not chosen. It is just an outline circle with a white/light interior.
+- Look for the circle that is darkest / most filled compared to the other 3 in that row.
+- A bubble can be filled with pencil (gray), ballpen (dark), or marker (solid black).
 
-HOW TO IDENTIFY A FILLED BUBBLE:
-- FILLED = the interior of the circle is DARKENED (solid black, heavy gray, or ink-shaded).
-- EMPTY = just a thin circular outline with a bright/white interior.
-- Compare all 4 circles in the SAME ROW. The filled one will be visibly darker than the other 3.
-- Only ONE bubble per row should be filled (the student's answer).
+COMMON PATTERNS:
+- Fully filled circle (solid black/dark) = chosen answer
+- Circle with an X or checkmark inside = chosen answer  
+- Heavy pencil shading inside circle = chosen answer
+- Light outline only = NOT chosen
+- Partially erased but still darker than empty = may be chosen (use darkest in row)
 
-CRITICAL — DO NOT MAKE THESE MISTAKES:
-1. Do NOT confuse which column is A, B, C, D. The leftmost circle in a row is ALWAYS A.
-2. Do NOT read the printed column header letters (A B C D) as an answer.
-3. Do NOT skip a row or shift answers by one row.
-4. Count rows carefully from the top of each column. Row 1 = Q1, Row 2 = Q2, etc.
-5. If a bubble is only slightly darker than the rest (ambiguous), still pick the darkest one.
+COLUMNS: The sheet may have 2 columns side by side (e.g. Q1-Q25 on left, Q26-Q50 on right).
+Read each column top to bottom, then proceed to the next column.
 
-VERIFICATION STEP (do this mentally before returning):
-- For each question, confirm you found exactly ONE dark circle and noted its column position (1st=A, 2nd=B, 3rd=C, 4th=D).
-- If all 4 circles look equally light/empty, return "" for that question.
-
-Return ONLY the letter (A, B, C, or D) of the FILLED bubble per question.
-If NO bubble is clearly filled, return "".`,
+Return ONLY the letter (A, B, C, or D) of the FILLED bubble for each question.
+If NO bubble is clearly filled for a question, return "".
+NEVER guess — only return a letter if one bubble is visibly darker than the other 3.`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -1704,9 +1704,8 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
         'Content-Type':  'application/json',
       },
       body: JSON.stringify({
-        model:       'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens:  1200,   // enough for 50 Q JSON + some buffer
-        temperature: 0,      // deterministic — no randomness in bubble reading
+        model:      'meta-llama/llama-4-scout-17b-16e-instruct',
+        max_tokens: 1000,
         messages: [{
           role: 'user',
           content: [
@@ -1821,57 +1820,63 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice' || examType === 'mc';
   const isWritten = !isMcType;
 
-// ── Route bubble_omr to Groq vision (most accurate for bubble sheets) ──
+  // ── Route bubble_omr: Jimp pixel detector FIRST, Groq only as last resort ──
+  // Jimp reads actual pixel darkness at each bubble's exact coordinates.
+  // It does NOT guess — it's deterministic math. Groq (AI) is unreliable for
+  // dense bubble grids because it confuses columns and misreads faint marks.
 if (isBubble) {
-  try {
-    // Pre-process the image specifically for bubble reading:
-    // - Resize to 2000px wide so Groq sees individual circles clearly
-    // - Increase contrast so filled vs empty bubbles are very distinct
-    // - NO binarization (threshold) — we want gray gradients so filled vs empty is clear
-    // - NO aggressive sharpening — bubbles should stay round, not get spikey edges
-    let bubbleBase64 = imageBase64;
-    let bubbleMime   = mimeType || 'image/jpeg';
-    if (sharp) {
-      try {
-        const inputBuffer = Buffer.from(imageBase64, 'base64');
-        const processed = await sharp(inputBuffer)
-          .rotate()                                    // fix EXIF orientation
-          .greyscale()                                 // remove colour noise
-          .modulate({ brightness: 1.10 })              // slightly lift dark images
-          .normalise()                                 // stretch contrast end-to-end
-          .sharpen({ sigma: 0.8 })                     // mild sharpening only — keep circles round
-          .resize({ width: 2000, fit: 'inside', withoutEnlargement: false })
-          .jpeg({ quality: 92 })
-          .toBuffer();
-        bubbleBase64 = processed.toString('base64');
-        bubbleMime   = 'image/jpeg';
-        console.log('[AutoChecker] Bubble image pre-processed for Groq ✓');
-      } catch (prepErr) {
-        console.warn('[AutoChecker] Bubble pre-processing failed, using raw image:', prepErr.message);
-      }
-    }
 
-    const groqResult = await scanWithGroq(bubbleBase64, bubbleMime, 'bubble_omr', questionCount);
-    if (groqResult && groqResult.answeredCount > 0) {
-      console.log(`[AutoChecker] Groq bubble read successful — ${groqResult.answeredCount}/${questionCount} bubbles detected`);
-      return groqResult;
+  // Pre-process: maximise contrast without destroying grayscale gradients.
+  // The adaptive threshold in Jimp NEEDS the gray gradient to distinguish
+  // filled vs empty — do NOT binarize (threshold) before passing to Jimp.
+  let processedBase64 = imageBase64;
+  let processedMime   = mimeType || 'image/jpeg';
+  if (sharp) {
+    try {
+      const inputBuf = Buffer.from(imageBase64, 'base64');
+      const processed = await sharp(inputBuf)
+        .rotate()                                          // fix EXIF orientation
+        .greyscale()                                       // remove colour
+        .modulate({ brightness: 1.05 })                   // slight lift for dark shots
+        .normalise()                                       // stretch contrast end-to-end
+        .resize({ width: TARGET_W, height: TARGET_H, fit: 'fill' }) // exact A4 canonical
+        .png()
+        .toBuffer();
+      processedBase64 = processed.toString('base64');
+      processedMime   = 'image/png';
+      console.log('[AutoChecker] Bubble image normalised for Jimp ✓');
+    } catch (e) {
+      console.warn('[AutoChecker] sharp pre-processing failed:', e.message);
     }
-    console.warn(`[AutoChecker] Groq bubble scan returned 0 answers — trying Jimp pixel detector`);
-  } catch (err) {
-    console.warn('[AutoChecker] Groq bubble detection failed:', err.message);
   }
-  // Jimp pixel-detection fallback
+
+  // PRIMARY: Jimp pixel detector
   try {
-    const jimpResult = await detectBubblesWithJimp(imageBase64, mimeType, questionCount);
-    if (jimpResult && jimpResult.answeredCount > 0) {
-      console.log(`[AutoChecker] Jimp bubble detection successful — ${jimpResult.answeredCount}/${questionCount} bubbles detected`);
+    const jimpResult = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
+    const minAcceptable = Math.ceil(questionCount * 0.30);
+    if (jimpResult && jimpResult.answeredCount >= minAcceptable) {
+      console.log(`[AutoChecker] Jimp pixel detection — ${jimpResult.answeredCount}/${questionCount} bubbles ✓`);
       return jimpResult;
     }
-    console.warn('[AutoChecker] Jimp bubble detection returned 0 answers — falling back to Tesseract');
+    console.warn(`[AutoChecker] Jimp found only ${jimpResult?.answeredCount ?? 0}/${questionCount} — trying Groq fallback`);
   } catch (err) {
-    console.warn('[AutoChecker] Jimp bubble detection failed:', err.message);
+    console.warn('[AutoChecker] Jimp detection error:', err.message);
   }
-  console.log('[AutoChecker] Falling back to Tesseract for bubble sheet...');
+
+  // FALLBACK: Groq vision (only if Jimp finds almost nothing)
+  if (groqReady) {
+    try {
+      const groqResult = await scanWithGroq(imageBase64, mimeType, 'bubble_omr', questionCount);
+      if (groqResult && groqResult.answeredCount > 0) {
+        console.log(`[AutoChecker] Groq fallback — ${groqResult.answeredCount}/${questionCount} bubbles`);
+        return groqResult;
+      }
+    } catch (err) {
+      console.warn('[AutoChecker] Groq fallback failed:', err.message);
+    }
+  }
+
+  console.log('[AutoChecker] All bubble engines failed — falling back to Tesseract');
 }
 
   // ── FIX: Mixed-mode path — run both OCR workers and extract per question range ──
