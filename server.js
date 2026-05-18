@@ -1252,7 +1252,7 @@ const OMR_LAYOUT = {
     ROW_STEP:    0.0267,   // 30/1123  — row pitch
     BUBBLE_R:    0.0113,   // 9/794    — full bubble half-width
     COL_LEFT:    [0.0479], // 38/794
-    Q_NUM_W:     0.0642,   // 51/794   — col-left-edge to bubble-A centre
+    Q_NUM_W:     0.0969,   // FIX: was 0.0642 — shifted one BUBBLE_STEP right to align A column
     BUBBLE_STEP: 0.0327,   // 26/794   — A→B centre pitch (bubbleW+BUBBLE_GAP=18+8)
   },
 
@@ -1264,7 +1264,12 @@ const OMR_LAYOUT = {
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
     COL_LEFT:    [0.0479, 0.5006],  // 38/794, 397.5/794
-    Q_NUM_W:     0.0642,
+    // FIX: was 0.0642 — this placed bubbleX0 (column A) at px 89, but sampling
+    // showed [0%, B%, 0%, 0%] meaning B's coordinate hit A's actual bubble.
+    // The grid was shifted one BUBBLE_STEP (0.0327) too far left.
+    // New Q_NUM_W = 0.0642 + 0.0327 = 0.0969, placing A-centre at ~116px.
+    // Verified against the printed sheet: A bubble centre ≈ col_left + q_num_w px.
+    Q_NUM_W:     0.0969,
     BUBBLE_STEP: 0.0327,
   },
 
@@ -1274,7 +1279,7 @@ const OMR_LAYOUT = {
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
     COL_LEFT:    [0.0479, 0.3498, 0.6517],
-    Q_NUM_W:     0.0642,
+    Q_NUM_W:     0.0969,  // FIX: same correction as 2-col (was 0.0642)
     BUBBLE_STEP: 0.0327,
   },
 };
@@ -1516,8 +1521,10 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
     }
   }
 
-  // Reject blobs too small to be a registration mark (< 50 px²)
-  if (bestArea < 50) return null;
+  // Reject blobs too small OR too large to be a registration mark.
+  // < 50 px²: noise.  > 8000 px²: image border line / header box (NOT a reg mark).
+  // Printed reg squares ≈ 20×20 = 400 px² at source, up to ~4000 px² after warp.
+  if (bestArea < 50 || bestArea > 8000) return null;
   return { cx: bestSumX / bestArea, cy: bestSumY / bestArea };
 }
 
@@ -1526,7 +1533,10 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
 // (Old value was 10% which was too small for some phone aspect ratios.)
 const searchW = Math.round(imgW * 0.18);
 const searchH = Math.round(imgH * 0.18);
-const cornerThr = Math.min(otsuThreshold(gray) * 0.75, 100); // dark registration marks
+// FIX: was capped at 100 which was too low for phone photos (printed black squares
+// can appear as gray ~120-150 after JPEG compression).  Raised to 160.
+// Also raised multiplier from 0.75 → 0.85 so the threshold is less aggressive.
+const cornerThr = Math.min(otsuThreshold(gray) * 0.85, 160); // dark registration marks
 
 const tlBlob = findCornerBlob(gray, imgW, imgH, 0, 0, searchW, searchH, cornerThr);
 const trBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, 0, imgW, searchH, cornerThr);
@@ -1577,6 +1587,11 @@ const H = imgH;
   const rowStep = layout.ROW_STEP * H;
   const OPTIONS = ['A', 'B', 'C', 'D'];
   const allRatios = {};
+
+  // Debug: log Q1 pixel coordinates so grid alignment can be validated
+  const debugBubbleX0 = (layout.COL_LEFT[0] + layout.Q_NUM_W) * W;
+  const debugQ1_cy = Math.round(layout.GRID_TOP * H + 0 * rowStep + rowStep * 0.5);
+  console.log(`[BubbleOMR] Grid debug — Q1 centres: A(${Math.round(debugBubbleX0)},${debugQ1_cy}) B(${Math.round(debugBubbleX0+layout.BUBBLE_STEP*W)},${debugQ1_cy}) C(${Math.round(debugBubbleX0+2*layout.BUBBLE_STEP*W)},${debugQ1_cy}) D(${Math.round(debugBubbleX0+3*layout.BUBBLE_STEP*W)},${debugQ1_cy}) r=${r}px`);
 
   for (let col = 0; col < numCols; col++) {
     const bubbleX0 = (layout.COL_LEFT[col] + layout.Q_NUM_W) * W;
