@@ -1184,30 +1184,46 @@ try {
 //   1. Update HEADER_HEIGHT_PX to match the rendered header (print & measure)
 //   2. Run: node -e "const PH=1123,PW=794,PAD=12,OPD=33,HDRH=<new>; console.log((PAD+HDRH+OPD)/PH)"
 //   3. Update GRID_TOP with the result
-const OMR_LAYOUT = {
-  // 1-column (≤25 questions)
-  // GRID_TOP: fraction from top of image to first bubble-row slot (includes col header)
-  // ROW_STEP: fraction of image height per row = rowH(30px) / 1123
-  // BUBBLE_R: sampling radius = bubbleH/2 / page_width = 7/794
-  // Q_NUM_W: fraction from col-left-edge to bubble-A centre = (COL_PAD_H+qNumW+BUBBLE_MARGIN+bubbleW/2)/794
-  // BUBBLE_STEP: centre-to-centre between A→B→C→D = (bubbleW+BUBBLE_GAP)/794 = (18+6)/794
-  1: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
-       COL_LEFT: [0.0567],
-       Q_NUM_W: 0.0641, BUBBLE_STEP: 0.0302 },
 
-  // 2-column (26–50 questions) — calibrated to AutoChecker A4 sheet
-  // col0 left = 45/794 = 0.0567
-  // col1 left = (45 + 351.5 + 1)/794 = 397.5/794 = 0.5006
-  // Q_NUM_W = (6 + 34 + 2 + 9)/794 = 51/794 = 0.0642
-  // BUBBLE_STEP = (18+6)/794 = 24/794 = 0.0302
+// Canonical A4 dimensions at 96 dpi — module-level so all functions share them
+const TARGET_W   = 794;
+const TARGET_H   = 1123;
+const MARK_INSET = 27; // registration mark centre inset from paper edge (px)
+
+const OMR_LAYOUT = {
+  // Layout fractions are relative to the canonical 794×1123px A4 processing image.
+  // After perspective correction, every sheet maps to exactly these coordinates.
+  //
+  // CALIBRATION LOG (from actual scan):
+  //   Q26 showed [16.1%, 16.1%, 17.4%, 14.1%] — all 4 options ~equal.
+  //   This means the sampler was landing BETWEEN bubble centres (on the border rings).
+  //   Root cause: Q_NUM_W was 0.0642 → bubble-A at 96px.
+  //   Actual bubble-A is at 84px (12px = half a bubble step to the LEFT).
+  //   Fix: Q_NUM_W = (84-45)/794 = 39/794 = 0.0491
+  //
+  // Verified bubble centre positions (px) after fix:
+  //   Col0: A=84  B=108  C=132  D=156
+  //   Col1: A=436 B=460  C=484  D=508
+  //
+  // BUBBLE_R: use 7px radius (full bubble inner zone) since adaptive threshold
+  //           handles varying lighting — larger sample = more stable reading.
+
+  // 1-column (≤25 questions)
+  1: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0088,
+       COL_LEFT: [0.0567],
+       Q_NUM_W: 0.0491, BUBBLE_STEP: 0.0302 },
+
+  // 2-column (26–50 questions) — CALIBRATED
+  // col0 left = 45/794 = 0.0567,  col1 left = 397.5/794 = 0.5006
+  // bubble-A X = col_left + Q_NUM_W*794 = 45 + 39 = 84px  ✓
   2: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0088,
        COL_LEFT: [0.0567, 0.5006],
-       Q_NUM_W: 0.0642, BUBBLE_STEP: 0.0302 },
+       Q_NUM_W: 0.0491, BUBBLE_STEP: 0.0302 },
 
   // 3-column (51–100 questions)
-  3: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0113,
+  3: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0088,
        COL_LEFT: [0.0567, 0.3526, 0.6486],
-       Q_NUM_W: 0.0617, BUBBLE_STEP: 0.0302 },
+       Q_NUM_W: 0.0491, BUBBLE_STEP: 0.0302 },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
 
@@ -1394,12 +1410,8 @@ for (let py = 0; py < imgH; py++) {
   }
 }
 
-// Canonical A4 dimensions — all layout fractions are relative to this
-const TARGET_W = 794;
-const TARGET_H = 1123;
-const MARK_INSET = 27; // MARK_CENTRE_FROM_PAPER_EDGE_PX from omrConfig
-
-// Warp corners to their IDEAL positions (not full canvas edges)
+// Canonical A4 dimensions — defined at module scope above
+// Warp corners to their IDEAL positions
 const idealTL = { x: MARK_INSET,             y: MARK_INSET };
 const idealTR = { x: TARGET_W - MARK_INSET,  y: MARK_INSET };
 const idealBR = { x: TARGET_W - MARK_INSET,  y: TARGET_H - MARK_INSET };
