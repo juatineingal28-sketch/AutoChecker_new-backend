@@ -1564,28 +1564,35 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
 
-    bubble_omr: `This is a BUBBLE SHEET (OMR) exam. The student filled in circles/bubbles to indicate their answers.
+    bubble_omr: `You are reading an AutoChecker BUBBLE ANSWER SHEET. Follow these rules EXACTLY.
 
-HOW TO READ A BUBBLE SHEET:
-- Each question row has 4 circles labeled A, B, C, D (left to right).
-- A FILLED bubble = the student's answer. It appears DARKENED, SHADED, or FILLED IN with pen/pencil.
-- An EMPTY bubble = not chosen. It is just an outline circle with a white/light interior.
-- Look for the circle that is darkest / most filled compared to the other 3 in that row.
-- A bubble can be filled with pencil (gray), ballpen (dark), or marker (solid black).
+SHEET LAYOUT:
+- The sheet has TWO columns of questions side by side separated by a vertical line.
+- LEFT column: questions 1–25 (top to bottom).
+- RIGHT column: questions 26–50 (top to bottom).
+- Each column has a header row showing: A  B  C  D  (these are column labels, NOT answers).
+- Below the header, each question row shows: [row number]  ○  ○  ○  ○
+  The four circles correspond to A (leftmost), B, C, D (rightmost) — in that exact order.
 
-COMMON PATTERNS:
-- Fully filled circle (solid black/dark) = chosen answer
-- Circle with an X or checkmark inside = chosen answer  
-- Heavy pencil shading inside circle = chosen answer
-- Light outline only = NOT chosen
-- Partially erased but still darker than empty = may be chosen (use darkest in row)
+HOW TO IDENTIFY A FILLED BUBBLE:
+- FILLED = the interior of the circle is DARKENED (solid black, heavy gray, or ink-shaded).
+- EMPTY = just a thin circular outline with a bright/white interior.
+- Compare all 4 circles in the SAME ROW. The filled one will be visibly darker than the other 3.
+- Only ONE bubble per row should be filled (the student's answer).
 
-COLUMNS: The sheet may have 2 columns side by side (e.g. Q1-Q25 on left, Q26-Q50 on right).
-Read each column top to bottom, then proceed to the next column.
+CRITICAL — DO NOT MAKE THESE MISTAKES:
+1. Do NOT confuse which column is A, B, C, D. The leftmost circle in a row is ALWAYS A.
+2. Do NOT read the printed column header letters (A B C D) as an answer.
+3. Do NOT skip a row or shift answers by one row.
+4. Count rows carefully from the top of each column. Row 1 = Q1, Row 2 = Q2, etc.
+5. If a bubble is only slightly darker than the rest (ambiguous), still pick the darkest one.
 
-Return ONLY the letter (A, B, C, or D) of the FILLED bubble for each question.
-If NO bubble is clearly filled for a question, return "".
-NEVER guess — only return a letter if one bubble is visibly darker than the other 3.`,
+VERIFICATION STEP (do this mentally before returning):
+- For each question, confirm you found exactly ONE dark circle and noted its column position (1st=A, 2nd=B, 3rd=C, 4th=D).
+- If all 4 circles look equally light/empty, return "" for that question.
+
+Return ONLY the letter (A, B, C, or D) of the FILLED bubble per question.
+If NO bubble is clearly filled, return "".`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -1697,8 +1704,9 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
         'Content-Type':  'application/json',
       },
       body: JSON.stringify({
-        model:      'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens: 1000,
+        model:       'meta-llama/llama-4-scout-17b-16e-instruct',
+        max_tokens:  1200,   // enough for 50 Q JSON + some buffer
+        temperature: 0,      // deterministic — no randomness in bubble reading
         messages: [{
           role: 'user',
           content: [
@@ -1813,10 +1821,37 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice' || examType === 'mc';
   const isWritten = !isMcType;
 
-  // ── Route bubble_omr to Groq vision (most accurate for bubble sheets) ──
+// ── Route bubble_omr to Groq vision (most accurate for bubble sheets) ──
 if (isBubble) {
   try {
-    const groqResult = await scanWithGroq(imageBase64, mimeType, 'bubble_omr', questionCount);
+    // Pre-process the image specifically for bubble reading:
+    // - Resize to 2000px wide so Groq sees individual circles clearly
+    // - Increase contrast so filled vs empty bubbles are very distinct
+    // - NO binarization (threshold) — we want gray gradients so filled vs empty is clear
+    // - NO aggressive sharpening — bubbles should stay round, not get spikey edges
+    let bubbleBase64 = imageBase64;
+    let bubbleMime   = mimeType || 'image/jpeg';
+    if (sharp) {
+      try {
+        const inputBuffer = Buffer.from(imageBase64, 'base64');
+        const processed = await sharp(inputBuffer)
+          .rotate()                                    // fix EXIF orientation
+          .greyscale()                                 // remove colour noise
+          .modulate({ brightness: 1.10 })              // slightly lift dark images
+          .normalise()                                 // stretch contrast end-to-end
+          .sharpen({ sigma: 0.8 })                     // mild sharpening only — keep circles round
+          .resize({ width: 2000, fit: 'inside', withoutEnlargement: false })
+          .jpeg({ quality: 92 })
+          .toBuffer();
+        bubbleBase64 = processed.toString('base64');
+        bubbleMime   = 'image/jpeg';
+        console.log('[AutoChecker] Bubble image pre-processed for Groq ✓');
+      } catch (prepErr) {
+        console.warn('[AutoChecker] Bubble pre-processing failed, using raw image:', prepErr.message);
+      }
+    }
+
+    const groqResult = await scanWithGroq(bubbleBase64, bubbleMime, 'bubble_omr', questionCount);
     if (groqResult && groqResult.answeredCount > 0) {
       console.log(`[AutoChecker] Groq bubble read successful — ${groqResult.answeredCount}/${questionCount} bubbles detected`);
       return groqResult;
