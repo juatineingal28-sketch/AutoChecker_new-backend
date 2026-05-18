@@ -1257,35 +1257,38 @@ const MARK_INSET = 27; // registration mark centre inset from paper edge (px)
 // GRID_TOP formula: (Q1_y_warped - 0.5*ROW_STEP_warped) / 1123
 const OMR_LAYOUT = {
   // 1-column (≤25 questions) — same grid as left col of 2-col sheet
+  // Derived from actual corner detection: TL(63,2)→(27,27), TR(636,2)→(767,27)
+  // Source A at 123px → warped 104px; step=62px → warped 80px
   1: {
-    GRID_TOP:    0.2139,
-    ROW_STEP:    0.0269,
-    BUBBLE_R:    0.0114,
+    GRID_TOP:    0.2287,
+    ROW_STEP:    0.0259,
+    BUBBLE_R:    0.0146,
     COL_LEFT:    [0.0000],
-    Q_NUM_W:     0.1760,
-    BUBBLE_STEP: 0.0887,
+    Q_NUM_W:     0.1316,
+    BUBBLE_STEP: 0.1008,
   },
 
   // 2-column (26–50 questions)
-  // Left col A=123px→140px warped. Right col A=414px→470px warped.
-  // COL_LEFT[1] = (470-140)/794 = 0.4163
+  // Source: Left col A=123px→warped 104px. Right col A=414px→warped 480px.
+  // COL_LEFT[1] = (480-104)/794 = 0.4733
+  // Scale X = 740/573 = 1.2914 (from corner blobs TL(63)→(27), TR(636)→(767))
   2: {
-    GRID_TOP:    0.2139,
-    ROW_STEP:    0.0269,
-    BUBBLE_R:    0.0114,
-    COL_LEFT:    [0.0000, 0.4163],
-    Q_NUM_W:     0.1760,
-    BUBBLE_STEP: 0.0887,
+    GRID_TOP:    0.2287,
+    ROW_STEP:    0.0259,
+    BUBBLE_R:    0.0146,
+    COL_LEFT:    [0.0000, 0.4733],
+    Q_NUM_W:     0.1316,
+    BUBBLE_STEP: 0.1008,
   },
 
-  // 3-column (51–100 questions) — third col offset estimated (2x right-col gap)
+  // 3-column (51–100 questions) — third col offset = col1 + same gap
   3: {
-    GRID_TOP:    0.2139,
-    ROW_STEP:    0.0269,
-    BUBBLE_R:    0.0114,
-    COL_LEFT:    [0.0000, 0.4163, 0.6600],
-    Q_NUM_W:     0.1760,
-    BUBBLE_STEP: 0.0887,
+    GRID_TOP:    0.2287,
+    ROW_STEP:    0.0259,
+    BUBBLE_R:    0.0146,
+    COL_LEFT:    [0.0000, 0.4733, 0.7000],
+    Q_NUM_W:     0.1316,
+    BUBBLE_STEP: 0.1008,
   },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
@@ -2925,4 +2928,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260518-omr-ground-truth-v5
+// redeploy-trigger-20260518-omr-layout-recalibrated-v6
