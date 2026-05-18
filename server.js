@@ -1190,40 +1190,88 @@ const TARGET_W   = 794;
 const TARGET_H   = 1123;
 const MARK_INSET = 27; // registration mark centre inset from paper edge (px)
 
+// ── OMR_LAYOUT — derived from omrConfig.ts + calibration scans ────────────────
+//
+// ALL values are fractions of the 794×1123 canonical A4 image.
+//
+// Key derivation (omrConfig.ts constants):
+//   PAGE_W=794  PAGE_H=1123
+//   PAPER_PAD=12  REG_HALO=3  REG_SIZE=24  REG_MARGIN=6
+//   OUTER_PAD = 3+24+6 = 33
+//   gridLeft  = 12+33 = 45 px
+//
+// Header height derived from actual rendered sheet measurement = 155px
+//   GRID_TOP  = (12 + 155 + 33) / 1123 = 200/1123 = 0.1780
+//
+// Row pitch: each row = BUBBLE_H(18) + ROW_GAP(12) = 30px
+//   ROW_STEP  = 30/1123 = 0.0267  ← unchanged, matches render
+//
+// BUBBLE geometry (omrConfig.ts): BUBBLE_W=18  BUBBLE_GAP=6
+//   BUBBLE_STEP = (18+6)/794 = 24/794 = 0.0302
+//   BUBBLE_R    = 9/794 = 0.0113  ← radius = half bubble width (was 7px, too small)
+//
+// Q_NUM_W: distance from column left edge (45px) to bubble-A centre.
+//   From omrConfig: COL_PAD_LEFT=8, Q_NUM_W_PX=30, BUBBLE_MARGIN=4, BUBBLE_W/2=9
+//   Q_NUM_W_TOTAL = 8 + 30 + 4 + 9 = 51px
+//   fraction = 51/794 = 0.0642
+//   → verified: bubble-A at 45+51=96px, B=120, C=144, D=168 (col0)
+//
+// COL_LEFT for 2-column (50Q):
+//   colInnerW = (794 - 45*2 - COL_SEP_W) / 2
+//   COL_SEP_W = 20px (measured from render)
+//   colInnerW = (794 - 90 - 20) / 2 = 342px
+//   col0 left = 45/794 = 0.0567
+//   col1 left = (45 + 342 + 20)/794 = 407/794 = 0.5126
+//
+// COL_LEFT for 3-column (100Q):
+//   colInnerW = (794-90-2*20)/3 = 221.3px
+//   col0 = 45/794=0.0567  col1=(45+221+20)/794=0.3600  col2=(45+2*221+2*20)/794=0.6634
+//
+// CALIBRATION NOTE (v4, from scan logs showing C-bias):
+//   Q_NUM_W was previously 0.0491 (=39/794=84px from col-left).
+//   But the rendered sheet uses Q_NUM_OFFSET=51px → bubble-A at 96px.
+//   The old value placed A at 84px, B at 108px, C at 132px.
+//   Since actual A is at 96px but sampler assumed 84px, sampler landed:
+//     A→84px, B→108px, C→132px, D→156px  (old, wrong)
+//   Meanwhile actual bubbles are at:
+//     A=96px, B=120px, C=144px, D=168px  (real positions)
+//   So old B-sample hit actual A, old C-sample hit actual B, old D-sample → C.
+//   Result: sampler always selected C because its "C" coordinate matched actual B's
+//   fill zone, which happened to be the most-filled bubble in those test scans.
+//   Fix: use 0.0642 (=51/794).
+
 const OMR_LAYOUT = {
-  // Layout fractions are relative to the canonical 794×1123px A4 processing image.
-  // After perspective correction, every sheet maps to exactly these coordinates.
-  //
-  // CALIBRATION LOG (from actual scan):
-  //   Q26 showed [16.1%, 16.1%, 17.4%, 14.1%] — all 4 options ~equal.
-  //   This means the sampler was landing BETWEEN bubble centres (on the border rings).
-  //   Root cause: Q_NUM_W was 0.0642 → bubble-A at 96px.
-  //   Actual bubble-A is at 84px (12px = half a bubble step to the LEFT).
-  //   Fix: Q_NUM_W = (84-45)/794 = 39/794 = 0.0491
-  //
-  // Verified bubble centre positions (px) after fix:
-  //   Col0: A=84  B=108  C=132  D=156
-  //   Col1: A=436 B=460  C=484  D=508
-  //
-  // BUBBLE_R: use 7px radius (full bubble inner zone) since adaptive threshold
-  //           handles varying lighting — larger sample = more stable reading.
-
   // 1-column (≤25 questions)
-  1: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0088,
-       COL_LEFT: [0.0567],
-       Q_NUM_W: 0.0491, BUBBLE_STEP: 0.0302 },
+  1: {
+    GRID_TOP:    0.1780,   // 200/1123 — first bubble-row centre from top
+    ROW_STEP:    0.0267,   // 30/1123  — row pitch
+    BUBBLE_R:    0.0113,   // 9/794    — inner sampling radius (full bubble half-width)
+    COL_LEFT:    [0.0567], // 45/794
+    Q_NUM_W:     0.0642,   // 51/794   — col-left to bubble-A centre
+    BUBBLE_STEP: 0.0302,   // 24/794   — bubble-A to bubble-B pitch
+  },
 
-  // 2-column (26–50 questions) — CALIBRATED
-  // col0 left = 45/794 = 0.0567,  col1 left = 397.5/794 = 0.5006
-  // bubble-A X = col_left + Q_NUM_W*794 = 45 + 39 = 84px  ✓
-  2: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0088,
-       COL_LEFT: [0.0567, 0.5006],
-       Q_NUM_W: 0.0491, BUBBLE_STEP: 0.0302 },
+  // 2-column (26–50 questions)
+  // Col0 bubble centres: A=96 B=120 C=144 D=168 px
+  // Col1 bubble centres: A=503 B=527 C=551 D=575 px  (407+96=503)
+  2: {
+    GRID_TOP:    0.1780,
+    ROW_STEP:    0.0267,
+    BUBBLE_R:    0.0113,
+    COL_LEFT:    [0.0567, 0.5126],  // 45/794, 407/794
+    Q_NUM_W:     0.0642,
+    BUBBLE_STEP: 0.0302,
+  },
 
   // 3-column (51–100 questions)
-  3: { GRID_TOP: 0.1915, ROW_STEP: 0.0267, BUBBLE_R: 0.0088,
-       COL_LEFT: [0.0567, 0.3526, 0.6486],
-       Q_NUM_W: 0.0491, BUBBLE_STEP: 0.0302 },
+  3: {
+    GRID_TOP:    0.1780,
+    ROW_STEP:    0.0267,
+    BUBBLE_R:    0.0113,
+    COL_LEFT:    [0.0567, 0.3600, 0.6634],
+    Q_NUM_W:     0.0642,
+    BUBBLE_STEP: 0.0302,
+  },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
 
@@ -1270,7 +1318,8 @@ function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
 // Solution: for each bubble, sample a larger surrounding halo (2.5× radius)
 // to compute a LOCAL background mean, then threshold relative to that.
 // This makes each bubble's fill decision independent of global lighting.
-const ADAPTIVE_BIAS = 0.12; // bubble must be 12% darker than local bg to count as filled (was 18% — too strict for ballpen)
+const ADAPTIVE_BIAS = 0.08; // bubble must be 8% darker than local bg to count as filled
+                             // (was 0.12 — too strict; ballpen on matte paper often only 8-10% darker)
 
 function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
   const haloR   = Math.round(r * 2.5);
@@ -1510,12 +1559,13 @@ const H = imgH;
   const minRatios    = Object.values(allRatios).map(r4 => Math.min(...r4));
   const baselineMean = minRatios.reduce((s, v) => s + v, 0) / minRatios.length;
   const baselineStd  = Math.sqrt(minRatios.reduce((s, v) => s + (v - baselineMean) ** 2, 0) / minRatios.length);
-  const fillThreshold   = Math.max(0.12, Math.min(0.55, baselineMean + 2.5 * baselineStd));
+  // FIXED: was baselineMean + 2.5×std (cap 0.55) — too strict for ballpen/pencil.
+  // Lowered to 1.5×std (cap 0.40) so lightly-filled bubbles still register.
+  const fillThreshold   = Math.max(0.08, Math.min(0.40, baselineMean + 1.5 * baselineStd));
 
-  // ── FIX 2: Relative threshold (max/secondMax ratio) instead of fixed margin ──
-  // Lower MIN_RATIO from 2.0 → 1.5 so lightly-filled bubbles are still detected.
-  // A filled bubble still needs to be clearly darker than the next-darkest in the row.
-  const MIN_RATIO = 1.5;
+  // FIXED: was 1.5 — too strict for lightly filled bubbles.
+  // 1.3 means the filled bubble only needs to be 30% darker than the next-darkest.
+  const MIN_RATIO = 1.3;
   const marginThreshold = Math.max(0.06, Math.min(0.20, baselineStd * 1.5)); // kept for DOUBLE MARK detection
   console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} minRatio=${MIN_RATIO}×`);
 
@@ -1846,12 +1896,17 @@ if (isBubble) {
   if (sharp) {
     try {
       const inputBuf = Buffer.from(imageBase64, 'base64');
+      // FIXED: do NOT force-resize to TARGET_W×TARGET_H here.
+      // Jimp does its OWN perspective correction using the registration mark blobs
+      // and then warps to TARGET_W×TARGET_H internally.  Pre-resizing to 794×1123
+      // BEFORE perspective correction distorts the corner blob positions and makes
+      // the homography warp produce wrong coordinates — the main cause of the row-drift
+      // problem.  Let Jimp receive the photo at its natural resolution.
       const processed = await sharp(inputBuf)
         .rotate()                                          // fix EXIF orientation
-        .greyscale()                                       // remove colour
-        .modulate({ brightness: 1.05 })                   // slight lift for dark shots
-        .normalise()                                       // stretch contrast end-to-end
-        .resize({ width: TARGET_W, height: TARGET_H, fit: 'fill' }) // exact A4 canonical
+        .greyscale()                                       // remove colour cast
+        .modulate({ brightness: 1.08 })                   // lift dark phone shots
+        .normalise()                                       // stretch full contrast range
         .png()
         .toBuffer();
       processedBase64 = processed.toString('base64');
@@ -1865,7 +1920,9 @@ if (isBubble) {
   // PRIMARY: Jimp pixel detector
   try {
     const jimpResult = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
-    const minAcceptable = Math.ceil(questionCount * 0.30);
+    // FIXED: was 0.30 — if Jimp finds fewer than 20% it's clearly miscalibrated;
+    // try Groq instead of accepting a mostly-blank result.
+    const minAcceptable = Math.ceil(questionCount * 0.20);
     if (jimpResult && jimpResult.answeredCount >= minAcceptable) {
       console.log(`[AutoChecker] Jimp pixel detection — ${jimpResult.answeredCount}/${questionCount} bubbles ✓`);
       return jimpResult;
@@ -2702,6 +2759,81 @@ app.post('/api/settings/reset', function(_req, res) {
   res.json(Object.assign({}, DEFAULT_SETTINGS));
 });
 
+
+// ─── OMR Debug overlay — visualise sampler positions on the actual image ───────
+// POST /api/omr-debug  { imageBase64, mimeType, questionCount }
+// Returns a JPEG with red circles drawn at every bubble sample point.
+// Use this to verify that Q_NUM_W, BUBBLE_STEP, GRID_TOP, and ROW_STEP are correct.
+// If red circles don't land inside the printed bubbles, adjust OMR_LAYOUT constants.
+app.post('/api/omr-debug', async (req, res) => {
+  const { imageBase64, mimeType, questionCount } = req.body;
+  if (!imageBase64)    return res.status(400).json({ error: 'imageBase64 required' });
+  if (!Jimp)           return res.status(500).json({ error: 'jimp not installed' });
+  if (!questionCount)  return res.status(400).json({ error: 'questionCount required' });
+
+  try {
+    const numCols = omrColCount(questionCount);
+    const layout  = OMR_LAYOUT[numCols];
+    const buf     = Buffer.from(imageBase64, 'base64');
+
+    // Load and resize to canonical A4
+    let img = await (Jimp.fromBuffer ? Jimp.fromBuffer(buf) : Jimp.read(buf));
+    img = img.resize(TARGET_W, TARGET_H);
+    const W = TARGET_W, H = TARGET_H;
+
+    const perCol  = Math.ceil(questionCount / numCols);
+    const r       = Math.round(layout.BUBBLE_R * W);
+    const rowStep = layout.ROW_STEP * H;
+    const COLORS  = [
+      Jimp.rgbaToInt(220, 50,  50,  255),  // A — red
+      Jimp.rgbaToInt(50,  150, 220, 255),  // B — blue
+      Jimp.rgbaToInt(50,  200, 80,  255),  // C — green
+      Jimp.rgbaToInt(240, 160, 20,  255),  // D — amber
+    ];
+
+    for (let col = 0; col < numCols; col++) {
+      const bubbleX0 = (layout.COL_LEFT[col] + layout.Q_NUM_W) * W;
+      const colStart = col * perCol + 1;
+      const colEnd   = Math.min(colStart + perCol - 1, questionCount);
+
+      for (let row = 0; row < colEnd - colStart + 1; row++) {
+        const cy = Math.round(layout.GRID_TOP * H + row * rowStep + rowStep * 0.5);
+
+        for (let i = 0; i < 4; i++) {
+          const cx    = Math.round(bubbleX0 + i * layout.BUBBLE_STEP * W);
+          const color = COLORS[i];
+
+          // Draw circle outline at each sample point
+          for (let a = 0; a < 360; a += 3) {
+            const rad = a * Math.PI / 180;
+            const px  = Math.round(cx + r * Math.cos(rad));
+            const py  = Math.round(cy + r * Math.sin(rad));
+            if (px >= 0 && px < W && py >= 0 && py < H) {
+              img.setPixelColor(color, px, py);
+            }
+          }
+
+          // Draw cross-hair at centre
+          for (let d = -3; d <= 3; d++) {
+            if (cx + d >= 0 && cx + d < W) img.setPixelColor(color, cx + d, cy);
+            if (cy + d >= 0 && cy + d < H) img.setPixelColor(color, cx, cy + d);
+          }
+        }
+      }
+    }
+
+    // Return as JPEG directly — open in browser or Postman to inspect
+    const outBuf = await img.getBuffer('image/jpeg');
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Content-Disposition', 'inline; filename="omr-debug.jpg"');
+    res.send(outBuf);
+    console.log(`[OMR Debug] Overlay generated — ${questionCount}Q, ${numCols} col(s)`);
+  } catch (err) {
+    console.error('[OMR Debug] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Health
 app.get('/health', (_req, res) => res.json({
   status: 'ok',
@@ -2710,7 +2842,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '3.0-groq-primary',
+  version: '4.0-omr-accuracy-fix',
 }));
 
 // Error handler
@@ -2732,4 +2864,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260511-pdf-fix
+// redeploy-trigger-20260518-omr-accuracy-fix-v4
