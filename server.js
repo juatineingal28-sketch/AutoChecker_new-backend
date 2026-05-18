@@ -1323,8 +1323,9 @@ function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
 // Solution: for each bubble, sample a larger surrounding halo (2.5× radius)
 // to compute a LOCAL background mean, then threshold relative to that.
 // This makes each bubble's fill decision independent of global lighting.
-const ADAPTIVE_BIAS = 0.08; // bubble must be 8% darker than local bg to count as filled
-                             // (was 0.12 — too strict; ballpen on matte paper often only 8-10% darker)
+const ADAPTIVE_BIAS = 0.12; // bubble must be 12% darker than local bg to count as filled
+                             // (raised from 0.08 — the printed oval border ring can contribute
+                             //  ~8% dark pixels in the inner zone, causing false positives)
 
 function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
   const haloR   = Math.round(r * 2.5);
@@ -1472,29 +1473,66 @@ const idealBR = { x: TARGET_W - MARK_INSET,  y: TARGET_H - MARK_INSET };
 const idealBL = { x: MARK_INSET,             y: TARGET_H - MARK_INSET };
 
 // ── Corner fiducial blob detection ──────────────────────────────────────────
-// Search each corner quadrant for the darkest connected blob (registration mark).
-// Uses a simple connected-component approach: scan a small search region near
-// each corner, find pixels darker than the local threshold, then compute centroid.
+// Finds the LARGEST connected dark blob in a corner search region.
+// Using centroid averaging (the old approach) is unreliable because any dark
+// text, shadow, or border in the search region pulls the centroid away from
+// the true registration mark.  BFS connected-component analysis finds the
+// single largest compact blob, which is almost always the printed square mark.
 function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, darkThr) {
-  let sumX = 0, sumY = 0, count = 0;
+  const lw = searchX1 - searchX0;
+  const lh = searchY1 - searchY0;
+  const visited = new Uint8Array(lw * lh);
+
+  let bestArea = 0, bestSumX = 0, bestSumY = 0;
+
   for (let y = searchY0; y < searchY1; y++) {
     for (let x = searchX0; x < searchX1; x++) {
-      if (grayArr[y * W + x] < darkThr) { sumX += x; sumY += y; count++; }
+      const li = (y - searchY0) * lw + (x - searchX0);
+      if (visited[li] || grayArr[y * W + x] >= darkThr) continue;
+
+      // BFS flood fill to find this connected component
+      const queue = [y * W + x];
+      visited[li] = 1;
+      let sumX = 0, sumY = 0, area = 0, head = 0;
+
+      while (head < queue.length) {
+        const idx = queue[head++];
+        const cy2 = Math.floor(idx / W);
+        const cx2 = idx % W;
+        sumX += cx2; sumY += cy2; area++;
+        const nbrs = [[cx2-1,cy2],[cx2+1,cy2],[cx2,cy2-1],[cx2,cy2+1]];
+        for (const [nx, ny] of nbrs) {
+          if (nx < searchX0 || nx >= searchX1 || ny < searchY0 || ny >= searchY1) continue;
+          const nli = (ny - searchY0) * lw + (nx - searchX0);
+          if (visited[nli] || grayArr[ny * W + nx] >= darkThr) continue;
+          visited[nli] = 1;
+          queue.push(ny * W + nx);
+        }
+      }
+
+      if (area > bestArea) {
+        bestArea = area; bestSumX = sumX; bestSumY = sumY;
+      }
     }
   }
-  if (count < 4) return null; // not enough dark pixels — mark absent
-  return { cx: sumX / count, cy: sumY / count };
+
+  // Reject blobs too small to be a registration mark (< 50 px²)
+  if (bestArea < 50) return null;
+  return { cx: bestSumX / bestArea, cy: bestSumY / bestArea };
 }
 
-// Search region: 8% of image dimensions inward from each corner
-const searchW = Math.round(imgW * 0.10);
-const searchH = Math.round(imgH * 0.10);
+// Search region: 18% of image dimensions — large enough to catch marks even on
+// tilted phone photos, while still excluding the bubble grid area.
+// (Old value was 10% which was too small for some phone aspect ratios.)
+const searchW = Math.round(imgW * 0.18);
+const searchH = Math.round(imgH * 0.18);
 const cornerThr = Math.min(otsuThreshold(gray) * 0.75, 100); // dark registration marks
 
 const tlBlob = findCornerBlob(gray, imgW, imgH, 0, 0, searchW, searchH, cornerThr);
 const trBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, 0, imgW, searchH, cornerThr);
 const brBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, imgH - searchH, imgW, imgH, cornerThr);
 const blBlob = findCornerBlob(gray, imgW, imgH, 0, imgH - searchH, searchW, imgH, cornerThr);
+console.log(`[BubbleOMR] Image size: ${imgW}×${imgH}, searchRegion: ${searchW}×${searchH}, cornerThr: ${cornerThr}`);
 console.log(`[BubbleOMR] Corner blobs — TL:${tlBlob?'✓':'✗'} TR:${trBlob?'✓':'✗'} BR:${brBlob?'✓':'✗'} BL:${blBlob?'✓':'✗'}`);
 
 if (tlBlob && trBlob && brBlob && blBlob) {
@@ -2866,7 +2904,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
 });
 
-// Keep-alive ping â€” prevents Railway from sleeping
+// Keep-alive Sping â€” prevents Railway from sleeping
 setInterval(() => {
   fetch('https://autocheckernew-backend-production.up.railway.app/health')
     .catch(() => {});
