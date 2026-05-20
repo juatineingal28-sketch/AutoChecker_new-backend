@@ -2923,9 +2923,10 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 // Keep-alive Sping â€” prevents Railway from sleeping
+// Keep-alive ping — prevents Render from sleeping
 setInterval(() => {
-  fetch('https://autocheckernew-backend-production.up.railway.app/health')
+  fetch('https://autochecker-new-backend.onrender.com/health')
     .catch(() => {});
-}, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
+}, 4 * 60 * 1000);// reduced from 5min — Railway sleeps at 5min inactivity
 
 // redeploy-trigger-20260518-omr-layout-recalibrated-v6
