@@ -1048,6 +1048,54 @@ function firstWordIfTooLong(raw) {
 function extractWrittenAnswers(text, questionCount, examType) {
   const answers = {};
   const maxQ    = Math.max(questionCount + 5, 20);
+  const isTf    = examType === 'truefalse' || examType === 'true_or_false';
+
+  // ── FIX: True/False dedicated fast-path ────────────────────────────────────
+  // T and F are single characters. The generic numbered-line regex below
+  // captures them fine, but PSM output often puts them on their own line
+  // BEFORE the question number (exam format: "___F___  6. HTML is used...").
+  // We handle all T/F formats explicitly here so none fall through to "?".
+  if (isTf) {
+    // Pattern A: "6. F" / "6) T" / "Q6 T" — number then T/F on same line
+    const RE_TF_INLINE = /[Qq]?(\d{1,3})\s*[.):\-\/]?\s*([TtFf])(?:\s|$)/g;
+    let mTf;
+    while ((mTf = RE_TF_INLINE.exec(text)) !== null) {
+      const q = parseInt(mTf[1], 10);
+      if (q >= 1 && q <= maxQ && !answers[String(q)]) {
+        answers[String(q)] = normaliseWritten(mTf[2], examType);
+      }
+    }
+
+    // Pattern B: standalone T or F line, followed by a line starting with a number
+    // e.g.:  "F\n6. HTML is used to style web pages."
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    for (let i = 0; i < lines.length - 1; i++) {
+      const tfMatch  = lines[i].match(/^([TtFf])\s*$/);
+      if (!tfMatch) continue;
+      const nextNum  = lines[i + 1].match(/^[Qq]?(\d{1,3})\s*[.):\-\s]/);
+      if (!nextNum) continue;
+      const q = parseInt(nextNum[1], 10);
+      if (q >= 1 && q <= maxQ && !answers[String(q)]) {
+        answers[String(q)] = normaliseWritten(tfMatch[1], examType);
+      }
+    }
+
+    // Pattern C: "true" / "false" written in full, same line as number
+    const RE_TF_FULL = /[Qq]?(\d{1,3})\s*[.):\-\/]?\s*(true|false)(?:\s|$)/gi;
+    let mTfFull;
+    while ((mTfFull = RE_TF_FULL.exec(text)) !== null) {
+      const q = parseInt(mTfFull[1], 10);
+      if (q >= 1 && q <= maxQ && !answers[String(q)]) {
+        answers[String(q)] = normaliseWritten(mTfFull[2], examType);
+      }
+    }
+
+    // Fill any remaining blanks
+    for (let i = 1; i <= questionCount; i++) {
+      if (!answers[String(i)]) answers[String(i)] = '';
+    }
+    return answers;
+  }
 
   // Strategy 1: numbered lines
   const RE_NUMBERED = /^[Qq]?(\d{1,3})\s*[.):\-\/]?\s*(.{1,120})$/gm;
@@ -1102,6 +1150,16 @@ function normaliseWritten(raw, examType) {
     .replace(/[^\x20-\x7E]/g, '')   // strip non-printable
     .replace(/\s{2,}/g, ' ')         // collapse whitespace
     .trim();
+
+  // FIX: true_or_false must return "True" / "False" (capital first letter)
+  // because the grader does case-sensitive matching against those exact strings.
+  // Previously this fell through to toLowerCase() → "true"/"false" which never matched.
+  if (examType === 'truefalse' || examType === 'true_or_false') {
+    const lower = cleaned.toLowerCase();
+    if (lower === 't' || lower === 'true')  return 'True';
+    if (lower === 'f' || lower === 'false') return 'False';
+    return '';  // unrecognised T/F token → blank rather than a wrong string
+  }
 
   if (examType === 'short_answer' || examType === 'trace_error') {
     return cleaned; // preserve original capitalisation for open-ended
@@ -2025,6 +2083,10 @@ if (isBubble) {
     const imageBuffer = await preprocessImage(imageBase64, mimeType, 'multiple_choice');
 
     // Run MC worker and text worker in parallel
+    // FIX: For true_or_false questions, PSM 7 (single text line) works better than
+    // PSM 6 (uniform block) because T and F are single isolated characters per line.
+    const hasTrueFalse = Object.values(questionTypeMap).some(t => t === 'truefalse' || t === 'true_or_false');
+    const textPsm = hasTrueFalse ? 7 : 6;  // PSM 7 for T/F, PSM 6 for written words
     let mcText = '', textOcrText = '', engineConfidence = 0;
     try {
       const [mcOcr, textOcr] = await Promise.all([
@@ -2039,7 +2101,7 @@ if (isBubble) {
         })(),
         (async () => {
           if (workerTextReady) {
-            await workerText.setParameters({ tessedit_pageseg_mode: 6, preserve_interword_spaces: '1', tessedit_do_invert: '0', tessedit_char_whitelist: CHAR_WHITELIST_TEXT });
+            await workerText.setParameters({ tessedit_pageseg_mode: textPsm, preserve_interword_spaces: '1', tessedit_do_invert: '0', tessedit_char_whitelist: CHAR_WHITELIST_TEXT });
             const { data } = await workerText.recognize(imageBuffer);
             process.stdout.write('\n');
             return { text: data.text ?? '', confidence: data.confidence ?? 0 };
@@ -2712,17 +2774,46 @@ app.post('/api/scan-multi', async (req, res) => {
 
 app.post('/api/scan', async (req, res) => {
   const { imageBase64, mimeType, examType, sectionId, questionCount,
-          questionTypeMap, mixedMode } = req.body; // FIX: extract mixed-mode fields
+          questionTypeMap: clientQuestionTypeMap, mixedMode } = req.body;
   if (!imageBase64) return res.status(400).json({ success: false, error: 'imageBase64 is required.' });
   if (!examType)    return res.status(400).json({ success: false, error: 'examType is required.' });
 
   // Use questionCount from client — it's already derived from the answer key.
-  // Do NOT override with server-side key length; the paper may have fewer questions.
   const totalQs = Number(questionCount) || 10;
 
+  // ── FIX: Auto-build questionTypeMap from the answer key when not supplied ──
+  // When the app sends mixedMode=true but NO questionTypeMap (because the teacher
+  // didn't configure question ranges), every question is parsed using only
+  // primaryExamType — so T/F questions get the MC parser and return "?".
+  //
+  // Solution: if sectionId is provided and mixedMode is set but questionTypeMap
+  // is empty, load the answer key from disk and build the map automatically.
+  // Each question inherits its type from its answer key entry.
+  let questionTypeMap = clientQuestionTypeMap;
+  if (sectionId && (!questionTypeMap || Object.keys(questionTypeMap).length === 0)) {
+    try {
+      const store = readStore(sectionId);
+      if (store && Array.isArray(store.key) && store.key.length > 0) {
+        const autoMap = {};
+        store.key.forEach(item => {
+          autoMap[String(item.question)] = item.type; // backend type string
+        });
+        questionTypeMap = autoMap;
+        const hasMultipleTypes = new Set(Object.values(autoMap)).size > 1;
+        if (hasMultipleTypes) {
+          console.log(`[AutoChecker] Auto-built questionTypeMap from answer key — ${Object.keys(autoMap).length} questions, types: ${[...new Set(Object.values(autoMap))].join(', ')}`);
+        }
+      }
+    } catch (e) {
+      console.warn('[AutoChecker] Could not load answer key for auto questionTypeMap:', e.message);
+    }
+  }
+
+  // Determine if the exam is truly mixed (more than one question type)
+  const effectiveMixedMode = mixedMode ||
+    (questionTypeMap && new Set(Object.values(questionTypeMap)).size > 1);
+
   // Wait up to 10s for persistent Tesseract workers on cold start.
-  // Without this, the first request after Railway wakes up falls through to
-  // a slow temp-worker path that can exceed the client's 60s timeout.
   if (!workerMCReady && !workerTextReady) {
     console.log('[AutoChecker] Workers not ready — waiting up to 10s for warm-up...');
     for (let i = 0; i < 20; i++) {
@@ -2739,7 +2830,7 @@ app.post('/api/scan', async (req, res) => {
 
     const { studentName, answers, answeredCount, engineConfidence, confidence } =
       await parseVisionText(imageBase64, mimeType || 'image/jpeg', examType, totalQs,
-        questionTypeMap, mixedMode); // FIX: pass mixed-mode fields through
+        questionTypeMap, effectiveMixedMode); // FIX: pass effectiveMixedMode so auto-map activates mixed path
 
     let notes = '';
     if (confidence < 0.3) {
@@ -2923,10 +3014,9 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 // Keep-alive Sping â€” prevents Railway from sleeping
-// Keep-alive ping — prevents Render from sleeping
 setInterval(() => {
-  fetch('https://autochecker-new-backend.onrender.com/health')
+  fetch('https://autocheckernew-backend-production.up.railway.app/health')
     .catch(() => {});
-}, 4 * 60 * 1000);// reduced from 5min — Railway sleeps at 5min inactivity
+}, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
 // redeploy-trigger-20260518-omr-layout-recalibrated-v6
