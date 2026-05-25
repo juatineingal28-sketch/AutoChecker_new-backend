@@ -1336,90 +1336,79 @@ const MARK_INSET = 27; // registration mark centre inset from paper edge (px)
 //    a visual overlay. Adjust Q_NUM_W and COL_LEFT until circles land on bubbles.
 
 const OMR_LAYOUT = {
-  // ── VALUES VERIFIED FROM LIVE SCAN LOGS (empirical ground truth) ─────────
-  // PAGE_W=794 PAGE_H=1123  GRID_TOP=0.1790  ROW_STEP=0.0267
+  // ── GROUND TRUTH — derived directly from omrConfig.ts renderer constants ──
   //
-  // KEY FINDING: real BUBBLE_STEP = 52px (not 26px from omrConfig BUBBLE_W+GAP).
-  // omrConfig BUBBLE_W=18, BUBBLE_GAP=8 → naive step=26, but the renderer adds
-  // extra spacing (cell-based layout), making the printed step = 52px.
+  // ALL fractions are relative to TARGET_W=794 × TARGET_H=1123 (A4 @ 96 dpi).
   //
-  // Verified from log: col1 ink at A(96px) and our-C(148px=96+52) → step=52 ✓
-  //                    col2 ink at our-B(475px) and our-D(527px=475+52) → step=52 ✓
+  // Renderer layout (omrConfig.ts v5.4, 50Q / 2-col):
+  //   PAPER_PAD=12, OUTER_PAD=33  → gridLeft = 45px
+  //   HEADER_HEIGHT ≈ 155px (measured: title+fields+dividers)
+  //   gridTop  = 155 + 33 = 188px
+  //   COL_HEADER_H = 22px (A B C D label row)
+  //   rowH     = 30px  (getRowHeightPx(50))
+  //   bubbleW  = 18px  (getBubbleWidthPx(50))
+  //   BUBBLE_GAP = 8px  →  bubbleStep = 18+8 = 26px
+  //   COL_PAD_H=6, qNumW=34, BUBBLE_MARGIN=2
+  //   Q_NUM_W_px = COL_PAD_H + qNumW + BUBBLE_MARGIN + bubbleW/2 = 6+34+2+9 = 51px
   //
-  // COL_LEFT[1] for 2-col: real col2 bubble-A = 423px (= 475-52)
-  //   COL_LEFT[1] = (423-51)/794 = 0.4685
+  //   singleColInnerW = (794 - 45*2 - 1) / 2 = 351.5px   (COL_SEP=1)
+  //   Col0 left = 45px   Col1 left = 45 + 351.5 + 1 = 397.5px
   //
-  // BUBBLE_R = 9px = 0.0113 (half of BUBBLE_H=18, confirmed by r=9px in logs)
+  //   Col0 bubble A centre = 45  + 51 = 96px    → 96/794  = 0.1209
+  //   Col1 bubble A centre = 397.5 + 51 = 448.5px → 448.5/794 = 0.5650
+  //
+  //   COL_LEFT[n] = col_n_left / 794
+  //     Col0: 45/794  = 0.0567
+  //     Col1: 397.5/794 = 0.5006
+  //
+  //   Q_NUM_W = 51/794 = 0.0642
+  //
+  //   BUBBLE_STEP = 26/794 = 0.0327
+  //
+  //   GRID_TOP: first row cy = gridTop + COL_HEADER_H + rowH/2 = 188+22+15 = 225px
+  //     GRID_TOP = (225 - rowH/2) / 1123 = 210/1123 = 0.1870
+  //     (formula: cy = GRID_TOP*H + row*ROW_STEP*H + 0.5*ROW_STEP*H
+  //               → at row=0: 225 = GRID_TOP*1123 + 15  → GRID_TOP = 0.1870)
+  //
+  //   ROW_STEP = 30/1123 = 0.0267
+  //   BUBBLE_R = 9/794  = 0.0113  (half bubble width — full radius for better sampling)
 
   // 1-column (≤25 questions)
   1: {
-    GRID_TOP:    0.1790,
+    GRID_TOP:    0.1870,
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
     COL_LEFT:    [0.0567],
     Q_NUM_W:     0.0642,
-    BUBBLE_STEP: 0.0655,
+    BUBBLE_STEP: 0.0327,
   },
 
-  // 2-column (26–50 questions) — VERIFIED from live scan logs
-  // Col0 bubble centres: A=96  B=148  C=200  D=252
-  // Col1 bubble centres: A=423 B=475  C=527  D=579
+  // 2-column (26–50 questions)
+  // Col0 bubble centres: A=96  B=122  C=148  D=174  (step=26px)
+  // Col1 bubble centres: A=449 B=475  C=501  D=527  (step=26px)
   2: {
-    GRID_TOP:    0.1790,
+    GRID_TOP:    0.1870,
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0567, 0.4685],
+    COL_LEFT:    [0.0567, 0.5006],
     Q_NUM_W:     0.0642,
-    BUBBLE_STEP: 0.0655,
+    BUBBLE_STEP: 0.0327,
   },
 
   // 3-column (51–100 questions)
-  // RE-CALIBRATED v6 for AutoChecker 75Q sheet (EXAM-20260517-DHS2 style)
-  //
-  // Measured from the printed AutoChecker sheet photo:
-  //   PAGE_W=794, PAGE_H=1123 (canonical A4 @ 96dpi after perspective correction)
-  //
-  //   Header block (title + name/section/date row + subject/test row + directions + exam-id bar)
-  //   visually ends at ≈ 195px from top.
-  //   OUTER_PAD = 33px  →  gridTop = 195 + 33 = 228px
-  //   GRID_TOP  = 228/1123 = 0.2030
-  //
-  //   Column header row (A B C D labels) height ≈ 20px
-  //   firstRowCy = gridTop + colHeaderH + rowH/2 = 228 + 20 + 12 = 260px
-  //   GRID_TOP_fraction = (firstRowCy - rowH/2) / 1123 = 248/1123 = 0.2208
-  //
-  //   3-col layout: each column width = (794 - 2*GRID_LEFT_OFFSET - 2*COL_SEP) / 3
-  //     GRID_LEFT_OFFSET ≈ 38px, COL_SEP = 1px
-  //     colW = (794 - 76 - 2) / 3 = 238.7px
-  //
-  //   Column left edges (content area):
-  //     Col0: 38px                   → 38/794  = 0.0479
-  //     Col1: 38 + 238.7 + 1 = 277.7 → 277.7/794 = 0.3498
-  //     Col2: 277.7 + 238.7 + 1 = 517.4 → 517.4/794 = 0.6517
-  //
-  //   qNumW for 75Q ≈ 28px (narrower than 50Q's 34px — fewer digit chars needed)
-  //   COL_PAD_H = 6px, BUBBLE_MARGIN = 2px
-  //   Q_NUM_W = (COL_PAD_H + qNumW + BUBBLE_MARGIN + bubbleW/2) / PAGE_W
-  //           = (6 + 28 + 2 + 9) / 794 = 45/794 = 0.0566
-  //
-  //   bubbleW = 18px, BUBBLE_GAP = 8px  →  bubbleStep = 26px
-  //   BUBBLE_STEP = 26/794 = 0.0327   (but 3-col is narrower, bubbleW shrinks)
-  //   For 75Q, bubbles scale down: bubbleW ≈ 14px, gap ≈ 6px → step = 20px
-  //   BUBBLE_STEP = 20/794 = 0.0252
-  //
-  //   rowH for 75Q = floor((1123 - gridTop - bottomPad) / 25) ≈ 24px
-  //   ROW_STEP = 24/1123 = 0.0214   (same as before, this was correct)
-  //   BUBBLE_R = 7/794 = 0.0088
-  //
-  // If bubbles still miss: use POST /api/omr-debug to generate a visual overlay,
-  // then nudge COL_LEFT values until circles land on the printed bubbles.
+  // colInnerW = (794 - 45*2 - 2) / 3 = 234px  (COL_SEP=1 × 2 gaps)
+  // Col0: 45px  Col1: 45+234+1=280px  Col2: 280+234+1=515px
+  // qNumW_75Q=30px, bubbleW_75Q=18px → Q_NUM_W_px = 6+30+2+9 = 47px
+  // bubbleStep_75Q = 18+8 = 26px (same formula, same bubble size)
+  // GRID_TOP same (same header)
+  // ROW_STEP_75Q = rowH_75Q/1123 = 30/1123 = 0.0267  (same rowH for 75Q)
   3: {
-    GRID_TOP:    0.1790,
+    GRID_TOP:    0.1870,
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
     COL_LEFT:    [0.0567, 0.3526, 0.6486],
     Q_NUM_W:     0.0592,
-    BUBBLE_STEP: 0.0655,
+    BUBBLE_STEP: 0.0327,
   },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
@@ -1466,7 +1455,7 @@ function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
 // which raises all fill ratios and makes the adaptive threshold unreliable.
 // Fix: only sample inside 0.70 * radius, matching omrImageProcessor.ts.
 const INK_ZONE_FACTOR = 0.70;
-const ADAPTIVE_BIAS   = 0.18; // bubble ink must be 18% darker than local background
+const ADAPTIVE_BIAS   = 0.12; // ink must be 12% darker than local background (was 18% — too strict for light ballpen)
 
 function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
   const haloR  = Math.round(r * 2.5);
@@ -1791,12 +1780,20 @@ const H = imgH;
 
   // Compute a per-scan adaptive floor:
   //   sort all values, take the 90th percentile as "max fill seen"
-  //   floor = max(0.08, maxFill * 0.15)  — at least 15% of the darkest bubble
+  //   floor = max(0.05, maxFill * 0.12)
+  //
+  // WHY LOWERED: ballpen-filled bubbles on a bright phone photo read 10-25%.
+  // The old formula (p90 * 0.20) with a 0.08 floor missed any bubble ≤ 0.40 p90,
+  // which is common on light-ink sheets. New values:
+  //   • absolute floor 0.05 (5%) — catches very light pencil/ballpen
+  //   • relative floor 12% of p90 — keeps blank-noise rejection working
+  //   • MIN_RATIO 1.35 — winner must be 35% darker than runner-up (was 1.4)
+  //   • DOUBLE_MARGIN 0.35 — slightly wider double-mark window for ambiguous ink
   const sorted90 = [...allRatioValues].sort((a, b) => a - b);
   const p90      = sorted90[Math.floor(sorted90.length * 0.90)] ?? 0;
-  const FILL_FLOOR = Math.max(0.08, Math.min(0.20, p90 * 0.20));
-  const MIN_RATIO  = 1.4;
-  const DOUBLE_MARGIN = 0.30; // two bubbles within 30% of each other = double mark
+  const FILL_FLOOR = Math.max(0.05, Math.min(0.18, p90 * 0.12));
+  const MIN_RATIO  = 1.35;
+  const DOUBLE_MARGIN = 0.35; // two bubbles within 35% of each other = double mark
 
   console.log(`[BubbleOMR] maxRatio=${(maxRatioSeen*100).toFixed(1)}% p90=${(p90*100).toFixed(1)}% → fillFloor=${(FILL_FLOOR*100).toFixed(1)}% minRatio=${MIN_RATIO}×`);
 
@@ -3104,7 +3101,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '5.1-omr-3col-recalibrated',
+  version: '5.2-omr-geometry-fix',
 }));
 
 // Error handler
@@ -3126,4 +3123,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260525-omr-step52-empirical-verified-v11
+// redeploy-trigger-20260525-omr-layout-geometry-fix-v12
