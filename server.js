@@ -2074,7 +2074,7 @@ if (isBubble) {
   // When mixedMode=true and questionTypeMap is provided, we run the MC worker
   // (for A-D answers) AND the text worker (for written answers) in parallel,
   // then assign results to each question based on its type in the map.
-  const hasMixedMap = effectiveMixedMode && questionTypeMap && Object.keys(questionTypeMap).length > 0;
+  const hasMixedMap = mixedMode && questionTypeMap && Object.keys(questionTypeMap).length > 0;
 
   if (hasMixedMap) {
     console.log('[AutoChecker] Mixed-mode scan — running dual OCR workers for', Object.keys(questionTypeMap).length, 'questions');
