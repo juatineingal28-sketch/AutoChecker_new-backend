@@ -1229,8 +1229,8 @@ const OMR_CONSTANTS = {
   ADAPTIVE_BIAS:     0.12,   // ink must be 12% darker than local bg (was 10%, catches shadow)
 
   // Fill classification
-  MIN_FILLED_PERCENT: 0.20,  // minimum fill to count as answered
-  BLANK_SIGMA_MULT:   2.0,   // fill floor = blank_mean + 2.0×blank_std (more sensitive)
+  MIN_FILLED_PERCENT: 0.15,  // minimum fill — ballpen on phone photo reads as low as 25%
+  BLANK_SIGMA_MULT:   1.5,   // fill floor = blank_mean + 1.5×blank_std — less aggressive
 
   // Double-mark detection — KEY FIX:
   // Real double-marks are very rare on ballpen sheets.
@@ -1246,8 +1246,8 @@ const OMR_CONSTANTS = {
   MARGIN_THRESH_MULT: 3.0,   // margin must exceed blank_std × 3.0 (was 3.5)
 
   // Second-pass retry
-  SECOND_PASS_CONF_THRESHOLD: 0.60,  // retry more questions (was 0.45)
-  SECOND_PASS_Y_OFFSETS: [-4, -3, -2, -1, 1, 2, 3, 4],  // wider Y search
+  SECOND_PASS_CONF_THRESHOLD: 0.50,  // retry low-confidence questions
+  SECOND_PASS_Y_OFFSETS: [-2, -1, 1, 2],  // tight ±2px only — larger offsets jump to wrong rows
 
   // Dynamic row recalibration (FIX 2)
   ROW_SNAP_SEARCH_RADIUS: 6,  // search ±6px around expected row Y (was 5)
@@ -1735,7 +1735,7 @@ function classifyQuestion(fills, fillFloor, blankStd, qNum) {
 
   // Case 1: All bubbles weak → BLANK (or weak-pick if above floor)
   if (best.f < MIN_FILLED_PERCENT) {
-    if (best.f >= fillFloor && best.f >= 0.13) {
+    if (best.f >= fillFloor && best.f >= 0.10) {
       const letter = OPTIONS[best.i];
       console.log(`[BubbleOMR] Q${qNum}: ${letter} (floor-pick: ${(best.f*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
       return { answer: letter, confidence: rawConfidence * 0.4, isDouble: false, isBlank: false };
@@ -1935,12 +1935,14 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
     perQMinRatios.reduce((s, v) => s + (v - blankMean) ** 2, 0) / (perQMinRatios.length || 1)
   );
 
-  // FIX: use 2.5× sigma (was 3.0 — too strict, caused false blanks)
-  const FILL_FLOOR = Math.max(0.06, Math.min(0.50, blankMean + OMR_CONSTANTS.BLANK_SIGMA_MULT * blankStd));
+  // Cap fillFloor at 0.30 — phone lighting can push blank reads to 14%+16% std=47% floor
+  // which blocks real ballpen answers (25-40% fill). Hard cap at 30%.
+  const rawFloor = blankMean + OMR_CONSTANTS.BLANK_SIGMA_MULT * blankStd;
+  const FILL_FLOOR = Math.max(0.06, Math.min(0.30, rawFloor));
   const sorted90   = [...allRatioValues].sort((a, b) => a - b);
   const p90        = sorted90[Math.floor(sorted90.length * 0.90)] ?? 0;
 
-  console.log(`[BubbleOMR] Blank baseline — mean=${(blankMean*100).toFixed(1)}% std=${(blankStd*100).toFixed(1)}% → fillFloor=${(FILL_FLOOR*100).toFixed(1)}% p90=${(p90*100).toFixed(1)}%`);
+  console.log(`[BubbleOMR] Blank baseline — mean=${(blankMean*100).toFixed(1)}% std=${(blankStd*100).toFixed(1)}% rawFloor=${(rawFloor*100).toFixed(1)}% → FILL_FLOOR=${(FILL_FLOOR*100).toFixed(1)}% p90=${(p90*100).toFixed(1)}%`);
 
   // ── 5. First-pass classification ──────────────────────────────────────────
   const answers     = {};
@@ -3314,7 +3316,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '7.0-smart-double-resolve',
+  version: '7.1-fillfloor-cap-secondpass-fix',
 }));
 
 // Error handler
@@ -3336,4 +3338,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v7-smart-double-resolve-accuracy-fix
+// redeploy-trigger-20260526-v71-fillfloor-cap-lowthreshold
