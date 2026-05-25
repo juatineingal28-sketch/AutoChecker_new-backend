@@ -1596,9 +1596,8 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
 // tilted phone photos, while still excluding the bubble grid area.
 // (Old value was 10% which was too small for some phone aspect ratios.)
 const searchW = Math.round(imgW * 0.22);
-const searchH = Math.round(imgH * 0.18);
-const _otsuFull = otsuThreshold(gray);
-const cornerThr = Math.round(_otsuFull * 0.85); // NO cap — relative to image brightness
+const searchH = Math.round(imgH * 0.22);
+const cornerThr = Math.round(otsuThreshold(gray) * 0.85); // NO cap — relative to image brightness
 
 const tlBlob = findCornerBlob(gray, imgW, imgH, 0, 0, searchW, searchH, cornerThr);
 const trBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, 0, imgW, searchH, cornerThr);
@@ -1681,7 +1680,7 @@ const H = imgH;
   const baselineStd  = Math.sqrt(minRatios.reduce((s, v) => s + (v - baselineMean) ** 2, 0) / minRatios.length);
   // FIXED: was baselineMean + 2.5×std (cap 0.55) — too strict for ballpen/pencil.
   // Lowered to 1.5×std (cap 0.40) so lightly-filled bubbles still register.
-  const fillThreshold = Math.max(0.08, Math.min(0.55, baselineMean + 2.0 * baselineStd));
+  const fillThreshold   = Math.max(0.08, Math.min(0.55, baselineMean + 2.0 * baselineStd));
 
   // FIXED: was 1.5 — too strict for lightly filled bubbles.
   // 1.3 means the filled bubble only needs to be 30% darker than the next-darkest.
