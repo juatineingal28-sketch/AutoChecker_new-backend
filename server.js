@@ -1648,8 +1648,14 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
     }
   }
 
-  // Reject blobs too small (noise) OR too large (image border/header line — not a reg mark)
-  if (bestArea < 20 || bestArea > 25000) return null;
+  // Reject blobs too small (noise) OR too large (image border/header line — not a reg mark).
+  // Area scales with (imgW/794)^2: on a 3120px-wide photo the 24px reg mark appears
+  // ~264px wide → area ~70000px². Use scale-aware limits so both full-res phone
+  // photos AND thumbnails work correctly.
+  const imgScaleSq = (W / 794) ** 2;
+  const minArea = Math.round(20  * imgScaleSq);
+  const maxArea = Math.round(180000 * imgScaleSq); // generous: rejects only page-spanning blobs
+  if (bestArea < minArea || bestArea > maxArea || bestCx < 0) return null;
   return { cx: bestSumX / bestArea, cy: bestSumY / bestArea };
 }
 
@@ -1660,20 +1666,32 @@ const searchW = Math.round(imgW * 0.22);
 const searchH = Math.round(imgH * 0.22);
 
 // Multi-threshold retry: try progressively lower thresholds until all 4 corners found.
-// Root cause of previous failures: Otsu on a bright white sheet gives ~94,
-// then *0.85 = 80, but the corner squares on this specific sheet are only slightly
-// darker than the paper, so we need to try down to *0.60 to reliably find them.
+// Root cause of previous failures: on a phone photo of a bright white sheet, the
+// global Otsu threshold is very high (~200). Even at factor=0.45 → ~90, the dark
+// printed squares may not be found because they appear as mid-grey (~80-140) on
+// camera images. Strategy: also try absolute thresholds (128, 100, 80, 60) which
+// work regardless of global image brightness.
 let tlBlob = null, trBlob = null, brBlob = null, blBlob = null;
 let cornerThr = 0;
 const otsuBase = otsuThreshold(gray);
-for (const factor of [0.85, 0.75, 0.65, 0.55, 0.45]) {
-  const thr = Math.round(otsuBase * factor);
+
+// Try Otsu-relative factors first, then absolute fallback thresholds
+const thresholdsToTry = [
+  Math.round(otsuBase * 0.85),
+  Math.round(otsuBase * 0.75),
+  Math.round(otsuBase * 0.65),
+  Math.round(otsuBase * 0.55),
+  Math.round(otsuBase * 0.45),
+  128, 110, 90, 70, 55,
+].filter((v, i, arr) => v > 10 && arr.indexOf(v) === i); // dedupe & remove near-zero
+
+for (const thr of thresholdsToTry) {
   const tl = findCornerBlob(gray, imgW, imgH, 0,            0,            searchW,      searchH,      thr);
   const tr = findCornerBlob(gray, imgW, imgH, imgW-searchW, 0,            imgW,         searchH,      thr);
   const br = findCornerBlob(gray, imgW, imgH, imgW-searchW, imgH-searchH, imgW,         imgH,         thr);
   const bl = findCornerBlob(gray, imgW, imgH, 0,            imgH-searchH, searchW,      imgH,         thr);
   const found = [tl,tr,br,bl].filter(Boolean).length;
-  console.log(`[BubbleOMR] cornerThr=${thr} (factor=${factor}) → TL:${tl?'✓':'✗'} TR:${tr?'✓':'✗'} BR:${br?'✓':'✗'} BL:${bl?'✓':'✗'}`);
+  console.log(`[BubbleOMR] cornerThr=${thr} → TL:${tl?'✓':'✗'} TR:${tr?'✓':'✗'} BR:${br?'✓':'✗'} BL:${bl?'✓':'✗'}`);
   if (found > [tlBlob,trBlob,brBlob,blBlob].filter(Boolean).length) {
     tlBlob = tl || tlBlob; trBlob = tr || trBlob;
     brBlob = br || brBlob; blBlob = bl || blBlob;
@@ -1778,40 +1796,55 @@ const H = imgH;
   // Double-mark: both top-2 above floor AND within 30% of each other.
   // Widened from 15% → 30% because light ink gives lower absolute margins.
 
-  // Compute a per-scan adaptive floor:
-  //   sort all values, take the 90th percentile as "max fill seen"
-  //   floor = max(0.05, maxFill * 0.12)
+  // ── Adaptive fill floor — per-scan blank-bubble baseline calibration ─────────
   //
-  // WHY LOWERED: ballpen-filled bubbles on a bright phone photo read 10-25%.
-  // The old formula (p90 * 0.20) with a 0.08 floor missed any bubble ≤ 0.40 p90,
-  // which is common on light-ink sheets. New values:
-  //   • absolute floor 0.05 (5%) — catches very light pencil/ballpen
-  //   • relative floor 12% of p90 — keeps blank-noise rejection working
-  //   • MIN_RATIO 1.35 — winner must be 35% darker than runner-up (was 1.4)
-  //   • DOUBLE_MARGIN 0.35 — slightly wider double-mark window for ambiguous ink
+  // STRATEGY (3-tier):
+  //   1. For each question, take the MINIMUM fill ratio (most-blank bubble).
+  //      These form the "blank baseline" distribution.
+  //   2. blank_mean + 3×blank_std = adaptive threshold (3-sigma rule).
+  //      This auto-adapts to dim classrooms, yellowed paper, ballpen vs pencil.
+  //   3. Hard clamp [0.08, 0.55] so extreme images don't break things.
+  //
+  // WHY NOT p90 * 0.12:
+  //   On a lightly-filled sheet p90 is only ~25%, giving a floor of 3%,
+  //   which means EVERY tiny shadow/border fleck qualifies → mass false DOUBLE MARKs.
+  //   Blank-baseline calibration is immune to fill density.
+
+  // Step 1: blank baseline from per-question minimum ratios
+  const perQMinRatios = Object.values(allRatios).map(r4 => Math.min(...r4));
+  const blankMean = perQMinRatios.reduce((s, v) => s + v, 0) / (perQMinRatios.length || 1);
+  const blankStd  = Math.sqrt(
+    perQMinRatios.reduce((s, v) => s + (v - blankMean) ** 2, 0) / (perQMinRatios.length || 1)
+  );
+  // 3-sigma above blank noise = fill threshold
+  const FILL_FLOOR    = Math.max(0.08, Math.min(0.55, blankMean + 3.0 * blankStd));
+  // Margin for double-mark disambiguation: must exceed blank noise × 4
+  const MARGIN_THRESH = Math.max(0.06, Math.min(0.25, blankStd * 4.0));
+  const MIN_RATIO     = 1.40; // winner must be ≥40% darker than runner-up
+
   const sorted90 = [...allRatioValues].sort((a, b) => a - b);
   const p90      = sorted90[Math.floor(sorted90.length * 0.90)] ?? 0;
-  const FILL_FLOOR = Math.max(0.05, Math.min(0.18, p90 * 0.12));
-  const MIN_RATIO  = 1.35;
-  const DOUBLE_MARGIN = 0.35; // two bubbles within 35% of each other = double mark
 
   console.log(`[BubbleOMR] maxRatio=${(maxRatioSeen*100).toFixed(1)}% p90=${(p90*100).toFixed(1)}% → fillFloor=${(FILL_FLOOR*100).toFixed(1)}% minRatio=${MIN_RATIO}×`);
+  console.log(`[BubbleOMR] Blank baseline — mean=${(blankMean*100).toFixed(1)}% std=${(blankStd*100).toFixed(1)}% marginThr=${(MARGIN_THRESH*100).toFixed(1)}%`);
 
   // Classify each question
   const answers = {};
   let doubleMarked = 0;
 
   for (const [qStr, ratios] of Object.entries(allRatios)) {
-    const sorted  = [...ratios].sort((a, b) => b - a);
-    const best    = sorted[0];
-    const second  = sorted[1] ?? 0;
-    const bestIdx = ratios.indexOf(best);
+    const sortedR  = [...ratios].sort((a, b) => b - a);
+    const best     = sortedR[0];
+    const second   = sortedR[1] ?? 0;
+    const bestIdx  = ratios.indexOf(best);
 
     const ratio  = second > 0.005 ? best / second : best / 0.005;
     const margin = best - second;
 
-    // Double mark: both top candidates are clearly filled AND nearly equal
-    if (best >= FILL_FLOOR && second >= FILL_FLOOR && margin < DOUBLE_MARGIN * best) {
+    // Double mark: BOTH top-2 are above floor AND closer together than the
+    // disambiguation margin. If they are clearly separated (margin > MARGIN_THRESH),
+    // accept the darker one even if both are above floor (erase-and-remark case).
+    if (best >= FILL_FLOOR && second >= FILL_FLOOR && margin < MARGIN_THRESH) {
       answers[String(qStr)] = '';
       doubleMarked++;
       console.log(`[BubbleOMR] Q${qStr}: DOUBLE MARK [${ratios.map(rv => (rv*100).toFixed(1)+'%').join(', ')}]`);
