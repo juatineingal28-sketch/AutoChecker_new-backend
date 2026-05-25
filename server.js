@@ -2057,78 +2057,6 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
 // fromQ / toQ: optional question range for mixed-mode scans.
 // When provided, Groq is told to ONLY read questions in that range,
 // preventing it from returning MC letters in T/F slots, etc.
-// Strict retry when the primary Groq call returns a hallucinated pattern.
-// Uses a stronger, laser-focused prompt that explicitly names the bad letter.
-async function scanWithGroqStrict(imageBase64, mimeType, questionCount, badLetter) {
-  if (!groqReady) return null;
-  const prompt = `You are re-reading a BUBBLE ANSWER SHEET because a previous attempt returned "${badLetter}" for almost every question, which is WRONG.
-
-TASK: Look at the physical bubble sheet image. For each question (1–${questionCount}), identify which of the 4 bubbles (A, B, C, D) has a DARK FILLED CENTER.
-
-⚠️  CRITICAL WARNING: The previous result was wrong because it returned "${badLetter}" for nearly every row.
-    THIS IS NOT CORRECT. Real answer sheets have varied answers: A, B, C, D distributed across questions.
-    You MUST look at each row individually and report what you ACTUALLY SEE — not assume "${badLetter}".
-
-HOW TO READ EACH ROW:
-1. Find the question number on the left.
-2. Look at the 4 circles to its right (A, B, C, D order).
-3. The FILLED bubble has a DARK BLACK CENTER — solid fill, not just an outline ring.
-4. The 3 EMPTY bubbles have a WHITE/LIGHT CENTER with just a dark outline ring.
-5. Report the letter of the ONE with the dark center.
-6. If genuinely unclear, use "".
-
-Return ONLY valid JSON: {"1":"C","2":"A","3":"D",...,"${questionCount}":"B"}
-No explanation. No markdown. No repeating patterns.`;
-
-  try {
-    const inputBuf = Buffer.from(imageBase64, 'base64');
-    let sendBase64 = imageBase64;
-    if (sharp) {
-      const buf = await sharp(inputBuf)
-        .resize(2400, 2400, { fit: 'inside', withoutEnlargement: true })
-        .jpeg({ quality: 92 })
-        .toBuffer();
-      sendBase64 = buf.toString('base64');
-    }
-
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model:       'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens:  1200,
-        temperature: 0,   // zero temperature for deterministic reading
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text',      text: prompt },
-            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${sendBase64}` } },
-          ],
-        }],
-      }),
-    });
-
-    if (!response.ok) return null;
-    const data    = await response.json();
-    const rawText = (data.choices?.[0]?.message?.content ?? '').trim();
-    console.log(`[Groq][Strict] Raw: ${rawText.slice(0, 200)}`);
-
-    const jsonMatch = rawText.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-    const parsed  = JSON.parse(jsonMatch[0]);
-    const answers = {};
-    for (let i = 1; i <= questionCount; i++) {
-      const v = (parsed[String(i)] ?? '').trim().toUpperCase();
-      answers[String(i)] = ['A','B','C','D'].includes(v) ? v : '';
-    }
-    const answeredCount = Object.values(answers).filter(a => a !== '').length;
-    return { studentName: null, answers, answeredCount, engineConfidence: 75, confidence: 0.75 };
-  } catch (e) {
-    console.warn('[Groq][Strict] retry failed:', e.message);
-    return null;
-  }
-}
-
 async function scanWithGroq(imageBase64, mimeType, examType, questionCount, fromQ = null, toQ = null) {
   if (!groqReady) {
     console.warn('[Groq] Not available — falling back to Tesseract');
@@ -2143,43 +2071,37 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
 
-    bubble_omr: `You are reading a physical BUBBLE ANSWER SHEET (OMR). Your job is to identify which bubble is FILLED IN for each question number.
+    bubble_omr: `This is an AutoChecker BUBBLE SHEET (OMR) exam. You must carefully identify which bubble is PHYSICALLY FILLED IN for each question.
 
-═══ HOW THE SHEET IS LAID OUT ═══
-- The sheet has 2 or 3 vertical columns of questions side by side.
-- Each question has exactly 4 bubbles in a horizontal row: A  B  C  D  (left to right).
-- The question number is printed to the LEFT of its 4 bubbles.
-- Column 1 typically has Q1–Q25, Column 2 has Q26–Q50, Column 3 has Q51–Q75.
-- READ ALL COLUMNS. Do not stop at Q25.
+LAYOUT — READ THIS CAREFULLY:
+- The sheet has columns of questions (e.g. 2 columns: Q1-Q25 on the LEFT, Q26-Q50 on the RIGHT; or 3 columns for 75Q).
+- Each question row shows 4 circles/ovals in order: A  B  C  D  (left to right).
+- The question number appears to the LEFT of the 4 bubbles.
 
-═══ HOW TO IDENTIFY A FILLED BUBBLE ═══
-✅ FILLED = the INTERIOR of the circle is DARK (solid black or heavily shaded by pen/pencil).
-✅ A filled bubble looks like a solid dark disc — the center is black.
-✅ Heavily shaded, or circle with X/slash inside = also counts as filled.
-❌ EMPTY = a thin ring outline only, with a white/light center = NOT chosen.
-❌ The printed circle BORDER is always dark — do NOT confuse the ring outline with a filled bubble.
-❌ Look at the CENTER of each circle. Only a dark CENTER means it is chosen.
+HOW TO IDENTIFY A FILLED BUBBLE:
+✅ FILLED = the inside of the circle is DARK (solid black, dark gray, or heavily shaded).
+   The student used a ballpen or pencil to shade/fill the circle interior.
+✅ Completely filled (solid dark disc) = answer.
+✅ Heavily shaded interior = answer.
+✅ Circle with X, checkmark, or slash inside = answer.
+❌ EMPTY = only a thin circular outline, with a WHITE/LIGHT interior = NOT chosen.
+❌ Do NOT confuse the printed circle border (outline) with a filled bubble.
+❌ Do NOT pick the darkest outline — the INTERIOR must be dark.
 
-═══ HOW TO COMPARE THE 4 BUBBLES IN EACH ROW ═══
-For every question row, compare all 4 bubbles side by side:
-- 3 bubbles will have a white/light center (empty)
-- 1 bubble will have a clearly dark/filled center (the answer)
-- Pick the ONE with the darkest interior. If none are filled, use "".
-- If two or more look filled, pick the one with the darkest, most complete fill.
+CRITICAL — DO NOT ASSUME PATTERNS:
+- Questions do NOT all have the same answer. Each row is independent.
+- Look at EACH row separately. The filled bubble position varies per question.
+- A is NOT always the answer. B is NOT always the answer.
+- Compare the 4 bubbles in a row: only the one with a DARK INTERIOR is chosen.
 
-═══ CRITICAL — DO NOT ASSUME PATTERNS ═══
-- Every question has a DIFFERENT answer. Read each row INDEPENDENTLY.
-- Do NOT return the same letter repeatedly. Real exams vary: A, C, D, B, A, etc.
-- If you find yourself returning mostly B's or mostly any one letter, STOP and re-examine. That is wrong.
-- The answer distribution WILL include A, B, C, and D in varying amounts.
+MULTI-COLUMN SHEETS:
+- LEFT column: Q1 at top going DOWN to Q25 (or Q50 for 1-col sheets).
+- RIGHT column: continues from Q26 downward (or Q51 for 3-col sheets).
+- Read ALL columns. Do not stop at Q25.
 
-═══ COLUMN READING ORDER ═══
-Go row by row within each column, top to bottom.
-Left column first (Q1 downward), then right column (Q26 downward), then third column if present.
-
-Return ONLY a valid JSON object mapping question number strings to answer letters.
-Empty/unanswered = "". No explanation. No markdown. No extra keys.
-Example: {"1":"C","2":"B","3":"A","4":"D","5":"A","6":"C",...}`,
+Return ONLY the letter (A, B, C, or D) of the bubble whose interior is clearly filled/shaded.
+If NO bubble interior is visibly darker than the others in that row, return "".
+NEVER default to B or any single letter — analyze each row independently.`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -2285,32 +2207,22 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
     console.log(`[Groq] Scanning ${examType} — ${rangeDesc}`);
 
     // ── Compress image before sending to Groq ────────────────────────────────
-    // Keep resolution HIGH for bubble sheets — small bubbles need detail.
-    // Groq limit is ~4MB base64. Use 2400px + quality 92 to stay under limit
-    // while preserving enough detail for each bubble to be clearly readable.
+    // Groq rejects images larger than ~4MB (413 error). Phone photos are often
+    // 3120×4160px (13MP) = 12–20MB base64. Resize to max 1600px on longest side.
     let groqImageBase64 = imageBase64;
     let groqMimeType    = mimeType || 'image/jpeg';
     if (sharp) {
       try {
-        const inputBuf   = Buffer.from(imageBase64, 'base64');
-        const isBubbleOmr = examType === 'bubble_omr' || examType === 'omr' || examType === 'bubble_mc';
-        // Bubble sheets need higher resolution so each small circle is readable.
-        // Written/MC sheets are fine at 1600px.
-        const maxPx = isBubbleOmr ? 2400 : 1600;
-        const jpgQ  = isBubbleOmr ? 92   : 85;
+        const inputBuf = Buffer.from(imageBase64, 'base64');
         const compressed = await sharp(inputBuf)
-          .resize(maxPx, maxPx, { fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: jpgQ })
+          .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 85 })
           .toBuffer();
-        // Safety: if still over 4MB base64, shrink once more
-        const finalBuf = compressed.length * 1.37 > 4 * 1024 * 1024
-          ? await sharp(compressed).resize(1800, 1800, { fit: 'inside' }).jpeg({ quality: 85 }).toBuffer()
-          : compressed;
-        groqImageBase64 = finalBuf.toString('base64');
+        groqImageBase64 = compressed.toString('base64');
         groqMimeType    = 'image/jpeg';
         const origKB = Math.round(imageBase64.length * 0.75 / 1024);
-        const compKB = Math.round(finalBuf.length / 1024);
-        console.log(`[Groq] Image resized: ${origKB}KB → ${compKB}KB (max ${maxPx}px, q${jpgQ})`);
+        const compKB = Math.round(compressed.length / 1024);
+        console.log(`[Groq] Image compressed: ${origKB}KB → ${compKB}KB`);
       } catch (compErr) {
         console.warn('[Groq] Image compression failed, using original:', compErr.message);
       }
@@ -2323,9 +2235,8 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
         'Content-Type':  'application/json',
       },
       body: JSON.stringify({
-        model:       'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens:  1200,
-        temperature: 0,
+        model:      'meta-llama/llama-4-scout-17b-16e-instruct',
+        max_tokens: 1000,
         messages: [{
           role: 'user',
           content: [
@@ -2440,275 +2351,70 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice' || examType === 'mc';
   const isWritten = !isMcType;
 
-  // ── Route bubble_omr: Groq AI vision FIRST, Jimp pixel detector as fallback ──
-  // ARCHITECTURE CHANGE v8.2:
-  // Groq vision (AI) is now the PRIMARY engine for bubble sheets.
-  // Reason: Jimp pixel detection requires perfect overhead alignment + calibrated
-  // grid constants. Phone photos taken at even slight angles cause grid drift that
-  // makes Jimp sample the wrong bubbles — producing wrong answers even though it
-  // "finds" 40-50 bubbles (so the fallback never triggers).
+  // ── Route bubble_omr: Jimp pixel detector PRIMARY, Groq AI as fallback ───────
+  // ARCHITECTURE CHANGE v9.0:
+  // Jimp is now PRIMARY. It uses perspective correction (4-corner homography),
+  // shadow normalization, CLAHE, and adaptive thresholding — deterministic and
+  // accurate when the sheet is photographed reasonably flat.
   //
-  // Groq vision SEES the actual filled bubble visually — it works regardless of:
-  //   - Camera angle / perspective
-  //   - Slight grid misalignment
-  //   - Varying lighting / shadows
-  //   - Different sheet prints (slight scaling differences)
+  // Groq is FALLBACK only — used when Jimp finds fewer than 70% of bubbles,
+  // which happens when corners aren't detected (extreme angle/lighting).
   //
-  // Jimp pixel detector is kept as fallback for when Groq is unavailable.
+  // Why Groq was demoted: it consistently hallucinates on dense 50-row sheets,
+  // returning the same letter for large blocks of questions regardless of prompting.
 if (isBubble) {
 
-  // ── Step 1: Pre-process the full image ──────────────────────────────────────
-  // Keep JPEG (not PNG) — PNG is 5-10x larger and forces Groq to crush it.
-  // Normalise contrast so filled bubbles are clearly darker than empty ones.
-  let processedBuf    = null;
+  // Pre-process for Jimp: sharp JPEG at full resolution, contrast enhanced.
+  // Keep JPEG (not PNG) — Jimp reads JPEG fine and it stays small.
   let processedBase64 = imageBase64;
   let processedMime   = mimeType || 'image/jpeg';
-
   if (sharp) {
     try {
       const inputBuf = Buffer.from(imageBase64, 'base64');
-      processedBuf = await sharp(inputBuf)
-        .rotate()                                         // auto-correct EXIF orientation
-        .resize(2400, 2400, { fit: 'inside', withoutEnlargement: true })
+      const processed = await sharp(inputBuf)
+        .rotate()                                      // fix EXIF orientation
+        .resize(1800, 1800, { fit: 'inside', withoutEnlargement: true })
         .modulate({ brightness: 1.05 })
         .normalise()
-        .sharpen({ sigma: 0.8, m1: 0.5, m2: 0.2 })
-        .jpeg({ quality: 92 })
+        .sharpen({ sigma: 0.6, m1: 0.4, m2: 0.1 })
+        .jpeg({ quality: 93 })
         .toBuffer();
-      processedBase64 = processedBuf.toString('base64');
+      processedBase64 = processed.toString('base64');
       processedMime   = 'image/jpeg';
-      const kb = Math.round(processedBuf.length / 1024);
-      console.log(`[AutoChecker] Bubble pre-processed: ${kb}KB JPEG ✓`);
+      const kb = Math.round(processed.length / 1024);
+      console.log(`[AutoChecker] v9.0 — Bubble pre-processed for Jimp: ${kb}KB JPEG ✓`);
     } catch (e) {
       console.warn('[AutoChecker] sharp pre-processing failed:', e.message);
     }
   }
 
-  // ── Step 2: Column-strip splitter ──────────────────────────────────────────
-  // ROOT CAUSE FIX: Groq reads the first column correctly, then loses attention
-  // over the rest of a dense 50-question sheet. Solution: crop the image into
-  // one vertical strip per column and scan each strip independently.
-  // Each strip has only 25 rows — Groq handles that reliably.
-  //
-  // AutoChecker sheet layout (from the actual printed sheet):
-  //   Header row at top ~14% of image height
-  //   2 columns for 50Q, 3 columns for 75Q
-  //   Each column occupies ~50% (2-col) or ~33% (3-col) of image width
-  //
-  // We add a 3% overlap on left/right edges to avoid clipping bubble outlines.
-
-  async function cropColumnStrip(fullBuf, colIndex, totalCols) {
-    if (!sharp || !fullBuf) return null;
-    try {
-      const meta      = await sharp(fullBuf).metadata();
-      const imgW      = meta.width;
-      const imgH      = meta.height;
-
-      // Header (student name, directions) takes ~14% of height — skip it
-      const headerFrac = 0.14;
-      const topY       = Math.floor(imgH * headerFrac);
-      const cropH      = imgH - topY;
-
-      // Each column width with 3% overlap on each side
-      const colFrac    = 1 / totalCols;
-      const overlapFrac = 0.03;
-      const rawLeft    = colIndex * colFrac;
-      const left       = Math.max(0, Math.floor(imgW * (rawLeft - overlapFrac)));
-      const right      = Math.min(imgW, Math.floor(imgW * (rawLeft + colFrac + overlapFrac)));
-      const cropW      = right - left;
-
-      const stripBuf = await sharp(fullBuf)
-        .extract({ left, top: topY, width: cropW, height: cropH })
-        .jpeg({ quality: 93 })
-        .toBuffer();
-
-      const kb = Math.round(stripBuf.length / 1024);
-      console.log(`[AutoChecker] Column ${colIndex + 1}/${totalCols} strip: ${kb}KB (x=${left}-${right}, y=${topY}-${imgH})`);
-      return stripBuf;
-    } catch (e) {
-      console.warn(`[AutoChecker] Column strip ${colIndex} failed:`, e.message);
-      return null;
-    }
-  }
-
-  // Hallucination guard — if >55% same letter in a strip, it's still wrong
-  function detectHallucination(answers) {
-    const vals  = Object.values(answers).filter(v => ['A','B','C','D'].includes(v));
-    if (vals.length === 0) return { isHallucinated: false };
-    const counts = { A: 0, B: 0, C: 0, D: 0 };
-    for (const v of vals) counts[v]++;
-    const maxCount  = Math.max(...Object.values(counts));
-    const maxLetter = Object.keys(counts).find(k => counts[k] === maxCount);
-    const ratio     = maxCount / vals.length;
-    return { isHallucinated: ratio > 0.55, dominantLetter: maxLetter, ratio };
-  }
-
-  // Scan one column strip: send ONLY that strip + its question range to Groq
-  async function scanColumnStrip(stripBuf, fromQ, toQ, colIdx) {
-    if (!groqReady || !stripBuf) return null;
-
-    const stripBase64 = stripBuf.toString('base64');
-    const colCount    = toQ - fromQ + 1;
-
-    const stripPrompt =
-`You are reading ONE COLUMN of a bubble answer sheet.
-This image shows ONLY questions ${fromQ} to ${toQ} (${colCount} rows).
-Each row has 4 circles: A  B  C  D  (left to right). The question number is on the left.
-
-HOW TO IDENTIFY THE FILLED BUBBLE:
-✅ FILLED = the interior/center of the circle is SOLID BLACK or heavily shaded.
-❌ EMPTY  = just a thin ring outline with a white center — do NOT pick these.
-
-FOR EVERY ROW:
-1. Look at all 4 circles in that row.
-2. Compare their centers — 3 will be white/light, 1 will be dark.
-3. Report the letter of the ONE with the dark center.
-4. If genuinely none are filled, use "".
-
-⚠️  WARNING: Do NOT return the same letter for most rows. Real sheets vary.
-    If you find yourself writing the same letter repeatedly, STOP and look again.
-    Each row is independent — the filled bubble is in a different position per question.
-
-Return ONLY a JSON object for questions ${fromQ}–${toQ}:
-{"${fromQ}":"C","${fromQ + 1}":"A","${fromQ + 2}":"D",...,"${toQ}":"B"}
-No explanation. No markdown. Only the JSON.`;
-
-    try {
-      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method:  'POST',
-        headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model:       'meta-llama/llama-4-scout-17b-16e-instruct',
-          max_tokens:  600,
-          temperature: 0,
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text',      text: stripPrompt },
-              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${stripBase64}` } },
-            ],
-          }],
-        }),
-      });
-
-      if (!response.ok) {
-        console.warn(`[AutoChecker] Column ${colIdx} Groq HTTP ${response.status}`);
-        return null;
-      }
-
-      const data    = await response.json();
-      const rawText = (data.choices?.[0]?.message?.content ?? '').trim();
-      console.log(`[AutoChecker] Col${colIdx} raw: ${rawText.slice(0, 150)}`);
-
-      const jsonMatch = rawText.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
-      if (!jsonMatch) return null;
-      const parsed  = JSON.parse(jsonMatch[0]);
-
-      const answers = {};
-      for (let i = fromQ; i <= toQ; i++) {
-        const v = (parsed[String(i)] ?? '').trim().toUpperCase();
-        answers[String(i)] = ['A','B','C','D'].includes(v) ? v : '';
-      }
-
-      const guard = detectHallucination(answers);
-      if (guard.isHallucinated) {
-        console.warn(`[AutoChecker] Col${colIdx} hallucination: ${(guard.ratio*100).toFixed(0)}% "${guard.dominantLetter}" — will retry this column`);
-        return null; // signal to retry with full-image fallback
-      }
-
-      const answered = Object.values(answers).filter(v => v !== '').length;
-      console.log(`[AutoChecker] Col${colIdx} ✓ — ${answered}/${colCount} answered`);
-      return answers;
-
-    } catch (e) {
-      console.warn(`[AutoChecker] Col${colIdx} scan error:`, e.message);
-      return null;
-    }
-  }
-
-  // PRIMARY: Column-strip scan with Groq
-  if (groqReady) {
-    try {
-      console.log('[AutoChecker] v8.4 — Bubble OMR: column-strip scan');
-
-      // Determine column count and per-column question ranges
-      const numCols   = questionCount <= 50 ? 2 : 3;
-      const perCol    = Math.ceil(questionCount / numCols);
-      const colRanges = [];
-      for (let c = 0; c < numCols; c++) {
-        const fromQ = c * perCol + 1;
-        const toQ   = Math.min((c + 1) * perCol, questionCount);
-        colRanges.push({ fromQ, toQ, colIdx: c + 1 });
-      }
-
-      // Crop strips (requires processedBuf from sharp)
-      const stripBufs = [];
-      if (processedBuf) {
-        for (const { colIdx } of colRanges) {
-          const buf = await cropColumnStrip(processedBuf, colIdx - 1, numCols);
-          stripBufs.push(buf);
-        }
-      }
-
-      // Scan each column — sequentially to avoid rate-limit
-      const mergedAnswers = {};
-      let   allSucceeded  = true;
-
-      for (let c = 0; c < colRanges.length; c++) {
-        const { fromQ, toQ, colIdx } = colRanges[c];
-        const stripBuf = stripBufs[c] ?? null;
-
-        let colAnswers = await scanColumnStrip(stripBuf, fromQ, toQ, colIdx);
-
-        // If column strip failed/hallucinated, retry with full image but restricted range
-        if (!colAnswers) {
-          console.warn(`[AutoChecker] Col${colIdx} strip failed — retrying with full image, range Q${fromQ}-Q${toQ}`);
-          const fullResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount, fromQ, toQ);
-          if (fullResult?.answers) {
-            const guard = detectHallucination(fullResult.answers);
-            if (!guard.isHallucinated) {
-              colAnswers = fullResult.answers;
-            } else {
-              console.warn(`[AutoChecker] Col${colIdx} full-image retry also hallucinated — skipping`);
-              allSucceeded = false;
-            }
-          } else {
-            allSucceeded = false;
-          }
-        }
-
-        if (colAnswers) Object.assign(mergedAnswers, colAnswers);
-      }
-
-      const answeredCount = Object.values(mergedAnswers).filter(v => v !== '').length;
-      if (answeredCount >= Math.ceil(questionCount * 0.50)) {
-        console.log(`[AutoChecker] Column-strip scan DONE — ${answeredCount}/${questionCount} bubbles ✓`);
-        return {
-          studentName:      null,
-          answers:          mergedAnswers,
-          answeredCount,
-          engineConfidence: allSucceeded ? 92 : 78,
-          confidence:       allSucceeded ? 0.92 : 0.78,
-        };
-      }
-      console.warn(`[AutoChecker] Column-strip only got ${answeredCount}/${questionCount} — falling back to Jimp`);
-
-    } catch (err) {
-      console.warn('[AutoChecker] Column-strip scan failed:', err.message);
-    }
-  }
-
-  // FALLBACK: Jimp pixel detector (when Groq unavailable or returns too few)
+  // PRIMARY: Jimp pixel detector — deterministic, no hallucination
   try {
+    console.log('[AutoChecker] v9.0 — Bubble OMR: Jimp pixel detector PRIMARY');
     const jimpResult = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
-    const minAcceptable = Math.ceil(questionCount * 0.20);
-    if (jimpResult && jimpResult.answeredCount >= minAcceptable) {
-      console.log(`[AutoChecker] Jimp pixel detection fallback — ${jimpResult.answeredCount}/${questionCount} bubbles ✓`);
+    const minGood    = Math.ceil(questionCount * 0.70); // need 70%+ to trust Jimp
+    if (jimpResult && jimpResult.answeredCount >= minGood) {
+      console.log(`[AutoChecker] Jimp PRIMARY ✓ — ${jimpResult.answeredCount}/${questionCount} bubbles detected`);
       return jimpResult;
     }
-    console.warn(`[AutoChecker] Jimp found only ${jimpResult?.answeredCount ?? 0}/${questionCount}`);
+    console.warn(`[AutoChecker] Jimp only found ${jimpResult?.answeredCount ?? 0}/${questionCount} — trying Groq fallback`);
   } catch (err) {
-    console.warn('[AutoChecker] Jimp detection error:', err.message);
+    console.warn('[AutoChecker] Jimp primary error:', err.message);
+  }
+
+  // FALLBACK: Groq AI vision — for when Jimp can't find corners (bad angle/light)
+  if (groqReady) {
+    try {
+      console.log('[AutoChecker] Groq AI vision FALLBACK — Jimp did not reach 70% threshold');
+      const groqResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount);
+      if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
+        console.log(`[AutoChecker] Groq fallback — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
+        return groqResult;
+      }
+      console.warn(`[AutoChecker] Groq fallback only got ${groqResult?.answeredCount ?? 0}/${questionCount}`);
+    } catch (err) {
+      console.warn('[AutoChecker] Groq fallback failed:', err.message);
+    }
   }
 
   console.log('[AutoChecker] All bubble engines failed — returning empty result');
