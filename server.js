@@ -2074,7 +2074,7 @@ if (isBubble) {
   // When mixedMode=true and questionTypeMap is provided, we run the MC worker
   // (for A-D answers) AND the text worker (for written answers) in parallel,
   // then assign results to each question based on its type in the map.
-  const hasMixedMap = mixedMode && questionTypeMap && Object.keys(questionTypeMap).length > 0;
+  const hasMixedMap = effectiveMixedMode && questionTypeMap && Object.keys(questionTypeMap).length > 0;
 
   if (hasMixedMap) {
     console.log('[AutoChecker] Mixed-mode scan — running dual OCR workers for', Object.keys(questionTypeMap).length, 'questions');
@@ -2308,12 +2308,11 @@ OUTPUT FORMAT: Return ONLY a valid JSON object with question numbers as keys.
   }
 
   // ── v3.0: Written types → Groq FIRST (much better at messy handwriting) ───
-  // Groq (llama-4-scout-17b-16e-instruct) is a real vision model that understands
-  // handwriting context. Tesseract is a character recognizer — it reads pixel
-  // shapes without understanding words, so messy writing defeats it.
-  // We now send written-type sheets to Groq first and only fall back to
-  // Tesseract if Groq is unavailable or returns zero answers.
-  if ((isWritten || isMcType) && groqReady) { // FIX: MC now also uses Groq first
+  // Only use Groq-first for written types (identification, enumeration, true_or_false).
+  // For multiple_choice, Tesseract with the MC whitelist is more accurate because
+  // it's constrained to A/B/C/D only. Groq tends to hallucinate when the page also
+  // has printed question text with letters in it.
+  if (isWritten && groqReady) {
     console.log('[AutoChecker] v3.0 — Written type: trying Groq vision FIRST (primary engine)');
     try {
       const groqResult = await scanWithGroq(imageBase64, mimeType, examType, questionCount);
