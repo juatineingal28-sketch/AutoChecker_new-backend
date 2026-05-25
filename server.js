@@ -3118,6 +3118,85 @@ app.post('/api/scan-multi', async (req, res) => {
 //             instead of 500 when OCR produces no usable text
 //             â†’ client never crashes on a bad scan
 
+
+// --- POST /api/scan-bubbles - accept pre-processed bubble measurements ----------
+// The phone's omrImageProcessor.ts runs a full local OMR pipeline and sends
+// BubbleMeasurement[] results here. This bypasses Groq (hallucinates) and Jimp
+// (needs perfect calibration). The phone processor sees the full-res image with
+// adaptive thresholding - far more accurate than any server-side approach.
+//
+// Body: { bubbles: [{questionNumber, option, fillRatio}], questionCount, sectionId, studentName }
+
+app.post('/api/scan-bubbles', async (req, res) => {
+  const { bubbles, questionCount, sectionId, studentName } = req.body;
+  if (!bubbles || !Array.isArray(bubbles) || bubbles.length === 0) {
+    return res.status(400).json({ success: false, error: 'bubbles array is required.' });
+  }
+  const totalQs = Number(questionCount) || 50;
+  console.log('[ScanBubbles] Received ' + bubbles.length + ' measurements for ' + totalQs + ' questions');
+
+  try {
+    const byQuestion = {};
+    for (const b of bubbles) {
+      const q = Number(b.questionNumber);
+      if (!q || q < 1 || q > totalQs) continue;
+      if (!byQuestion[q]) byQuestion[q] = [];
+      byQuestion[q].push({ option: String(b.option).toUpperCase(), fill: Number(b.fillRatio) || 0 });
+    }
+
+    const answers = {};
+    const confidences = {};
+
+    for (let q = 1; q <= totalQs; q++) {
+      const group = byQuestion[q];
+      if (!group || group.length === 0) { answers[String(q)] = ''; continue; }
+      group.sort((a, b) => b.fill - a.fill);
+      const best   = group[0];
+      const second = group[1];
+      const margin = best.fill - (second ? second.fill : 0);
+
+      if (best.fill < 0.15) {
+        answers[String(q)] = '';
+        confidences[String(q)] = 0;
+        continue;
+      }
+
+      // Double mark: both high AND very close
+      if (best.fill >= 0.40 && second && second.fill >= 0.40 && second.fill / best.fill >= 0.90) {
+        console.log('[ScanBubbles] Q' + q + ': double mark resolved to ' + best.option);
+      }
+
+      answers[String(q)] = best.option;
+      confidences[String(q)] = margin * best.fill;
+      console.log('[ScanBubbles] Q' + q + ': ' + best.option + ' (fill=' + (best.fill*100).toFixed(1) + '% margin=' + (margin*100).toFixed(1) + '%)');
+    }
+
+    for (let i = 1; i <= totalQs; i++) {
+      if (answers[String(i)] === undefined) answers[String(i)] = '';
+    }
+
+    const answeredCount = Object.values(answers).filter(a => a !== '').length;
+    const meanConf = Object.values(confidences).reduce((s, v) => s + v, 0) / Math.max(1, totalQs);
+    const confidence = Math.min(0.99, meanConf * 3.0);
+
+    console.log('[ScanBubbles] Done - answered: ' + answeredCount + '/' + totalQs + ', confidence: ' + (confidence*100).toFixed(1) + '%');
+
+    res.json({
+      success: true,
+      answers,
+      studentName: studentName || null,
+      confidence,
+      engineConfidence: confidence * 100,
+      answeredCount,
+      totalQuestions: totalQs,
+      notes: answeredCount < totalQs * 0.8 ? 'Some bubbles not detected. Ensure good lighting and flat paper.' : '',
+    });
+  } catch (err) {
+    console.error('[ScanBubbles] Error:', err.message);
+    res.status(500).json({ success: false, error: err.message, answers: buildEmptyAnswers(totalQs) });
+  }
+});
+
 app.post('/api/scan', async (req, res) => {
   const { imageBase64, mimeType, examType, sectionId, questionCount,
           questionTypeMap: clientQuestionTypeMap, mixedMode } = req.body;
@@ -3343,7 +3422,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '8.3-groq-compress-fix413',
+  version: '8.4-scan-bubbles-local-processor',
 }));
 
 // Error handler
@@ -3365,4 +3444,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v83-groq-image-compress-fix413
+// redeploy-trigger-20260526-v84-scan-bubbles-local-processor
