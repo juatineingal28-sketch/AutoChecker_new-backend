@@ -2324,72 +2324,75 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice' || examType === 'mc';
   const isWritten = !isMcType;
 
-  // ── Route bubble_omr: Jimp pixel detector FIRST, Groq only as last resort ──
-  // Jimp reads actual pixel darkness at each bubble's exact coordinates.
-  // It does NOT guess — it's deterministic math. Groq (AI) is unreliable for
-  // dense bubble grids because it confuses columns and misreads faint marks.
+  // ── Route bubble_omr: Groq AI vision FIRST, Jimp pixel detector as fallback ──
+  // ARCHITECTURE CHANGE v8.2:
+  // Groq vision (AI) is now the PRIMARY engine for bubble sheets.
+  // Reason: Jimp pixel detection requires perfect overhead alignment + calibrated
+  // grid constants. Phone photos taken at even slight angles cause grid drift that
+  // makes Jimp sample the wrong bubbles — producing wrong answers even though it
+  // "finds" 40-50 bubbles (so the fallback never triggers).
+  //
+  // Groq vision SEES the actual filled bubble visually — it works regardless of:
+  //   - Camera angle / perspective
+  //   - Slight grid misalignment
+  //   - Varying lighting / shadows
+  //   - Different sheet prints (slight scaling differences)
+  //
+  // Jimp pixel detector is kept as fallback for when Groq is unavailable.
 if (isBubble) {
 
   // Pre-process: maximise contrast without destroying grayscale gradients.
-  // The adaptive threshold in Jimp NEEDS the gray gradient to distinguish
-  // filled vs empty — do NOT binarize (threshold) before passing to Jimp.
   let processedBase64 = imageBase64;
   let processedMime   = mimeType || 'image/jpeg';
   if (sharp) {
     try {
       const inputBuf = Buffer.from(imageBase64, 'base64');
-      // FIXED: do NOT force-resize to TARGET_W×TARGET_H here.
-      // Jimp does its OWN perspective correction using the registration mark blobs
-      // and then warps to TARGET_W×TARGET_H internally.  Pre-resizing to 794×1123
-      // BEFORE perspective correction distorts the corner blob positions and makes
-      // the homography warp produce wrong coordinates — the main cause of the row-drift
-      // problem.  Let Jimp receive the photo at its natural resolution.
       const processed = await sharp(inputBuf)
-        .rotate()                                          // fix EXIF orientation
-        .greyscale()                                       // remove colour cast
-        .modulate({ brightness: 1.10, contrast: 1.15 })   // lift dark shots + boost ink contrast
-        .normalise()                                       // stretch full 0-255 range
-        .median(3)                                         // reduce phone camera noise
-        .sharpen({ sigma: 1.2, m1: 1.0, m2: 0.5 })        // sharpen bubble edges
+        .rotate()
+        .greyscale()
+        .modulate({ brightness: 1.10, contrast: 1.15 })
+        .normalise()
+        .median(3)
+        .sharpen({ sigma: 1.2, m1: 1.0, m2: 0.5 })
         .png()
         .toBuffer();
       processedBase64 = processed.toString('base64');
       processedMime   = 'image/png';
-      console.log('[AutoChecker] Bubble image normalised for Jimp ✓');
+      console.log('[AutoChecker] Bubble image normalised ✓');
     } catch (e) {
       console.warn('[AutoChecker] sharp pre-processing failed:', e.message);
     }
   }
 
-  // PRIMARY: Jimp pixel detector
+  // PRIMARY: Groq AI vision — reads filled bubbles visually, angle-tolerant
+  if (groqReady) {
+    try {
+      console.log('[AutoChecker] v8.2 — Bubble OMR: trying Groq AI vision FIRST (primary)');
+      const groqResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount);
+      if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
+        console.log(`[AutoChecker] Groq AI vision PRIMARY — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
+        return groqResult;
+      }
+      console.warn(`[AutoChecker] Groq returned only ${groqResult?.answeredCount ?? 0}/${questionCount} — trying Jimp fallback`);
+    } catch (err) {
+      console.warn('[AutoChecker] Groq primary failed, falling back to Jimp:', err.message);
+    }
+  }
+
+  // FALLBACK: Jimp pixel detector (when Groq unavailable or returns too few)
   try {
     const jimpResult = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
-    // FIXED: was 0.30 — if Jimp finds fewer than 20% it's clearly miscalibrated;
-    // try Groq instead of accepting a mostly-blank result.
     const minAcceptable = Math.ceil(questionCount * 0.20);
     if (jimpResult && jimpResult.answeredCount >= minAcceptable) {
-      console.log(`[AutoChecker] Jimp pixel detection — ${jimpResult.answeredCount}/${questionCount} bubbles ✓`);
+      console.log(`[AutoChecker] Jimp pixel detection fallback — ${jimpResult.answeredCount}/${questionCount} bubbles ✓`);
       return jimpResult;
     }
-    console.warn(`[AutoChecker] Jimp found only ${jimpResult?.answeredCount ?? 0}/${questionCount} — trying Groq fallback`);
+    console.warn(`[AutoChecker] Jimp found only ${jimpResult?.answeredCount ?? 0}/${questionCount}`);
   } catch (err) {
     console.warn('[AutoChecker] Jimp detection error:', err.message);
   }
 
-  // FALLBACK: Groq vision (only if Jimp finds almost nothing)
-  if (groqReady) {
-    try {
-      const groqResult = await scanWithGroq(imageBase64, mimeType, 'bubble_omr', questionCount);
-      if (groqResult && groqResult.answeredCount > 0) {
-        console.log(`[AutoChecker] Groq fallback — ${groqResult.answeredCount}/${questionCount} bubbles`);
-        return groqResult;
-      }
-    } catch (err) {
-      console.warn('[AutoChecker] Groq fallback failed:', err.message);
-    }
-  }
-
-  console.log('[AutoChecker] All bubble engines failed — falling back to Tesseract');
+  console.log('[AutoChecker] All bubble engines failed — returning empty result');
 }
 
   // ── FIX: Mixed-mode path — run both OCR workers and extract per question range ──
@@ -3318,7 +3321,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '8.1-3col-bubbleshift-fix',
+  version: '8.2-groq-primary-bubble-omr',
 }));
 
 // Error handler
@@ -3340,4 +3343,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v81-3col-recalibrated-bubbleshift-fix
+// redeploy-trigger-20260526-v82-groq-primary-bubble-omr
