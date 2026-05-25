@@ -1281,13 +1281,30 @@ const OMR_LAYOUT = {
     BUBBLE_STEP: 0.0353,
   },
   // 3-column layout (51–100 questions)
+  // RECALIBRATED v6.1 — measured from actual AutoChecker 75Q printed sheet.
+  //
+  // Physical sheet measurement (warped to 794×1123):
+  //   Col0 bubble centres: A=98  B=141  C=184  D=227  px  (step=43px)
+  //   Col1 bubble centres: A=325 B=368  C=411  D=454  px
+  //   Col2 bubble centres: A=551 B=594  C=637  D=680  px
+  //   First row cy ≈ 195px, row spacing ≈ 22.6px
+  //
+  //   Q_NUM_W   = 98  / 794 = 0.1234   (A-bubble x = Q_NUM_W * W, COL_LEFT[0]=0)
+  //   BUBBLE_STEP = 43 / 794 = 0.0542
+  //   COL_LEFT[1] = (325-98) / 794 = 0.2859
+  //   COL_LEFT[2] = (551-98) / 794 = 0.5705
+  //   GRID_TOP  = (195 - 0.5*22.6) / 1123 = 0.1636
+  //   ROW_STEP  = 22.6 / 1123 = 0.0201
+  //   BUBBLE_R  = 9px / 794 = 0.0113  (same physical bubble size)
+  //
+  // Verify with /api/omr-debug — red circles must land on the printed bubble circles.
   3: {
-    GRID_TOP:    0.1870,
-    ROW_STEP:    0.0267,
+    GRID_TOP:    0.1636,
+    ROW_STEP:    0.0201,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0567, 0.3526, 0.6486],
-    Q_NUM_W:     0.0592,
-    BUBBLE_STEP: 0.0327,
+    COL_LEFT:    [0.0000, 0.2859, 0.5705],
+    Q_NUM_W:     0.1234,
+    BUBBLE_STEP: 0.0542,
   },
 };
 
