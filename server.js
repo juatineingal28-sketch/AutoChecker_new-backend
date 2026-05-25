@@ -1247,10 +1247,10 @@ const OMR_CONSTANTS = {
 
   // Second-pass retry
   SECOND_PASS_CONF_THRESHOLD: 0.50,  // retry low-confidence questions
-  SECOND_PASS_Y_OFFSETS: [-2, -1, 1, 2],  // tight ±2px only — larger offsets jump to wrong rows
+  SECOND_PASS_Y_OFFSETS: [-3, -2, -1, 1, 2, 3],  // ±3px local refinement
 
   // Dynamic row recalibration (FIX 2)
-  ROW_SNAP_SEARCH_RADIUS: 6,  // search ±6px around expected row Y (was 5)
+  ROW_SNAP_SEARCH_RADIUS: 12, // search ±12px — needed when ROW_STEP is slightly off
   ROW_SNAP_MIN_DARK_FRAC: 0.06, // a row needs ≥6% dark pixels (was 8%, more sensitive)
 
   // Preprocessing
@@ -1291,8 +1291,8 @@ const OMR_LAYOUT = {
   //   Col1: A=448 B=529  C=610  D=691 px  (448 from old confirmed log)
   //   COL_LEFT[1] = (448-92)/794 = 0.4484
   2: {
-    GRID_TOP:    0.1800,
-    ROW_STEP:    0.0292,
+    GRID_TOP:    0.1780,
+    ROW_STEP:    0.0310,
     BUBBLE_R:    0.0113,
     COL_LEFT:    [0.0000, 0.4484],
     Q_NUM_W:     0.1159,
@@ -3316,7 +3316,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '7.1-fillfloor-cap-secondpass-fix',
+  version: '7.2-rowstep-recalibrated',
 }));
 
 // Error handler
@@ -3338,4 +3338,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v71-fillfloor-cap-lowthreshold
+// redeploy-trigger-20260526-v72-rowstep-0310-snap12
