@@ -1398,12 +1398,12 @@ const OMR_LAYOUT = {
   // If bubbles still miss: use POST /api/omr-debug to generate a visual overlay,
   // then nudge COL_LEFT values until circles land on the printed bubbles.
   3: {
-    GRID_TOP:    0.2208,
-    ROW_STEP:    0.0214,
-    BUBBLE_R:    0.0088,
-    COL_LEFT:    [0.0479, 0.3498, 0.6517],
-    Q_NUM_W:     0.0566,
-    BUBBLE_STEP: 0.0252,
+    GRID_TOP:    0.1790,
+    ROW_STEP:    0.0267,
+    BUBBLE_R:    0.0113,
+    COL_LEFT:    [0.0567, 0.3526, 0.6486],
+    Q_NUM_W:     0.0592,
+    BUBBLE_STEP: 0.0327,
   },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
@@ -3097,4 +3097,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260525-omr-3col-recalibrated-v7
+// redeploy-trigger-20260525-omr-3col-exact-from-omrconfig-v8
