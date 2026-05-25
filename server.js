@@ -1262,23 +1262,36 @@ const OMR_CONSTANTS = {
 // 2-col (50Q) confirmed pixel coords from live server log:
 //   Q1 A(104,271) B(185,271) C(265,271) D(345,271) r=12px
 const OMR_LAYOUT = {
-  // 1-column layout (≤25 questions)
+  // ── 1-column layout (1–25 questions) ──────────────────────────────────────
+  // Same bubble dimensions as 2-col. BUBBLE_STEP = 81px/794 = 0.1020
+  // Q_NUM_W: 92px/794 = 0.1159 (A-bubble absolute x on canvas)
   1: {
-    GRID_TOP:    0.1870,
-    ROW_STEP:    0.0267,
+    GRID_TOP:    0.1800,
+    ROW_STEP:    0.0292,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0567],
-    Q_NUM_W:     0.0642,
-    BUBBLE_STEP: 0.0327,
+    COL_LEFT:    [0.0000],
+    Q_NUM_W:     0.1159,
+    BUBBLE_STEP: 0.1020,
   },
-  // 2-column layout (26–50 questions)
+  // ── 2-column layout (26–50 questions) ─────────────────────────────────────
+  // RECALIBRATED v6.2 from live log + confirmed measurements:
+  //   Log shows: Q1 A=92px, cy=219px — GRID_TOP/ROW_STEP confirmed correct.
+  //   Real bubble step = 81px (confirmed from old log: A=104→B=185, step=81)
+  //   Previous BUBBLE_STEP=0.0353 was 28px — 3x too small! All 4 sample points
+  //   landed inside a single real bubble → every question read as contaminated.
+  //
+  //   Q_NUM_W   = 92/794  = 0.1159  (COL_LEFT[0]=0, so A_x = Q_NUM_W * W)
+  //   BUBBLE_STEP = 81/794 = 0.1020
+  //   Col0: A=92  B=173  C=254  D=335 px
+  //   Col1: A=448 B=529  C=610  D=691 px  (448 from old confirmed log)
+  //   COL_LEFT[1] = (448-92)/794 = 0.4484
   2: {
     GRID_TOP:    0.1800,
     ROW_STEP:    0.0292,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0554, 0.5100],
-    Q_NUM_W:     0.0604,
-    BUBBLE_STEP: 0.0353,
+    COL_LEFT:    [0.0000, 0.4484],
+    Q_NUM_W:     0.1159,
+    BUBBLE_STEP: 0.1020,
   },
   // 3-column layout (51–100 questions)
   // RECALIBRATED v6.1 — measured from actual AutoChecker 75Q printed sheet.
@@ -3280,7 +3293,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '6.0-omr-engine-v6-full-rewrite',
+  version: '6.2-omr-bubble-step-fix',
 }));
 
 // Error handler
