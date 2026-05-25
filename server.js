@@ -1224,34 +1224,33 @@ const MARK_INSET = 27; // registration mark center inset from paper edge (px)
 // ── OMR Detection constants — all named, none magic ───────────────────────────
 const OMR_CONSTANTS = {
   // Bubble sampling
-  INK_ZONE_FACTOR:   0.55,   // sample inner 55% of radius — slightly wider to catch more fill
-  CENTER_WEIGHT_EXP: 2.5,    // balanced center weighting
-  ADAPTIVE_BIAS:     0.12,   // ink must be 12% darker than local bg — more tolerant
+  INK_ZONE_FACTOR:   0.55,
+  CENTER_WEIGHT_EXP: 2.5,
+  ADAPTIVE_BIAS:     0.12,
 
   // Fill classification
-  MIN_FILLED_PERCENT: 0.12,  // lower minimum — some ballpen fills read as low as 15%
-  BLANK_SIGMA_MULT:   1.2,   // less aggressive floor = blank_mean + 1.2*std
+  MIN_FILLED_PERCENT: 0.12,
+  BLANK_SIGMA_MULT:   1.2,
 
-  // Double-mark detection — v9.1: very strict to avoid false doubles
-  DOUBLE_MARK_RATIO: 0.97,   // both must be >=97% identical — nearly impossible unless truly double
-  MIN_DOUBLE_FILL:   0.55,   // BOTH bubbles must exceed 55%
+  // Double-mark — v9.2: always resolve to highest fill, never blank
+  DOUBLE_MARK_RATIO: 0.95,   // trigger double-check when second ≥95% of best
+  MIN_DOUBLE_FILL:   0.50,   // both must be ≥50% to be a double candidate
 
   // Winner disambiguation
-  MIN_RATIO:         1.15,   // winner needs 15% stronger than runner-up
+  MIN_RATIO:         1.12,
   MARGIN_THRESH_MULT: 2.0,
 
-  // Second-pass retry — v9.1 KEY FIX:
-  // Was 0.65 → triggered retry on 46/50 questions → second pass snapped to
-  // adjacent row ink or question number labels → made results WORSE.
-  // Now 0.20 → only retry near-blank questions (no clear winner found).
-  SECOND_PASS_CONF_THRESHOLD: 0.20,
-  SECOND_PASS_Y_OFFSETS: [-2, -1, 1, 2],  // reduced to ±2px
+  // Second-pass retry — v9.2: only truly ambiguous questions retry
+  SECOND_PASS_CONF_THRESHOLD: 0.18,
+  SECOND_PASS_Y_OFFSETS: [-2, -1, 1, 2],
 
-  // Row snapping — v9.1 KEY FIX:
-  // Was 12px → snapped to wrong rows / number label ink → corrupted reads.
-  // Now 4px → only corrects tiny mechanical offsets.
-  ROW_SNAP_SEARCH_RADIUS: 4,
-  ROW_SNAP_MIN_DARK_FRAC: 0.10,  // require stronger ink signal before snapping
+  // Row snapping — v9.2 KEY FIX:
+  // Increased back to 10px from 4px. The perspective warp leaves 5-12px residual
+  // Y error per row. The new snapRowY v9.2 is smarter — it scans a 2D rectangle
+  // instead of a 1D line, and requires a 15% improvement over no-snap before
+  // committing. This prevents over-snapping while allowing real drift correction.
+  ROW_SNAP_SEARCH_RADIUS: 10,
+  ROW_SNAP_MIN_DARK_FRAC: 0.18,  // requires 18% dark pixel density to snap
 
   // Preprocessing
   GAUSSIAN_SIGMA: 0.8,
@@ -1279,34 +1278,24 @@ const OMR_LAYOUT = {
     BUBBLE_STEP: 0.1020,
   },
   // ── 2-column layout (26–50 questions) ─────────────────────────────────────
-  // RECALIBRATED v9.1 — derived from actual scan log analysis:
+  // RECALIBRATED v6.2 from live log + confirmed measurements:
+  //   Log shows: Q1 A=92px, cy=219px — GRID_TOP/ROW_STEP confirmed correct.
+  //   Real bubble step = 81px (confirmed from old log: A=104→B=185, step=81)
+  //   Previous BUBBLE_STEP=0.0353 was 28px — 3x too small! All 4 sample points
+  //   landed inside a single real bubble → every question read as contaminated.
   //
-  // Log confirms after perspective warp to 794×1123:
-  //   Q1 A(100,211) B(170,211) r=9px  → BUBBLE_STEP = 70px = 0.0881
-  //
-  // Fill analysis reveals cross-contamination (Q7: A=97%,C=92% both high)
-  // means the 70px step is slightly small — adjacent bubbles bleed into each other.
-  // Root cause: AutoChecker sheet bubble centres are 75px apart, not 70px.
-  // The Q_NUM_W offset shifts the A sample 5px left of true bubble centre.
-  //
-  // Corrected measurements:
-  //   True A centre: ~105px (not 100px) → Q_NUM_W = 105/794 = 0.1322
-  //   True bubble spacing: 75px → BUBBLE_STEP = 75/794 = 0.0945
-  //   Col0: A=105  B=180  C=255  D=330 px
-  //   Col1: starts at 105 + layout.COL_LEFT[1]*794 ≈ 460px
-  //   COL_LEFT[1] = (460-105)/794 = 0.4472
-  //   GRID_TOP: first row centre at cy=211px → 211/1123 = 0.1880
-  //   ROW_STEP: 25 rows in ~700px remaining → 700/25/1123 = 0.0249
-  //   (tighter rows than previously assumed — sheet has 75 item slots total)
-  //
-  // BUBBLE_R: kept at 0.0113 (9px radius confirmed from log)
+  //   Q_NUM_W   = 92/794  = 0.1159  (COL_LEFT[0]=0, so A_x = Q_NUM_W * W)
+  //   BUBBLE_STEP = 81/794 = 0.1020
+  //   Col0: A=92  B=173  C=254  D=335 px
+  //   Col1: A=448 B=529  C=610  D=691 px  (448 from old confirmed log)
+  //   COL_LEFT[1] = (448-92)/794 = 0.4484
   2: {
-    GRID_TOP:    0.1880,
-    ROW_STEP:    0.0249,
+    GRID_TOP:    0.1780,
+    ROW_STEP:    0.0310,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0000, 0.4472],
-    Q_NUM_W:     0.1322,
-    BUBBLE_STEP: 0.0945,
+    COL_LEFT:    [0.0000, 0.4484],
+    Q_NUM_W:     0.1159,
+    BUBBLE_STEP: 0.1020,
   },
   // 3-column layout (51–100 questions)
   // RECALIBRATED v8.0 — re-measured from actual student's 75Q AutoChecker sheet photo.
@@ -1570,42 +1559,52 @@ function sampleBubbleWeighted(gray, W, H, cx, cy, r) {
 //   - Row drift from printing misalignment
 //   - Paper stretch from humid storage
 //   - Camera tilt causing perspective residual after homography
-function snapRowY(gray, W, expectedCy, bubbleXs, r) {
+function snapRowY(gray, W, H, expectedCy, bubbleXs, r) {
   const { ROW_SNAP_SEARCH_RADIUS, ROW_SNAP_MIN_DARK_FRAC } = OMR_CONSTANTS;
   const inkR = Math.max(2, Math.round(r * OMR_CONSTANTS.INK_ZONE_FACTOR));
 
+  // v9.2: Score each candidate Y by summing darkness across a full vertical
+  // band around each bubble X centre (not just a single horizontal line).
+  // This makes the snap robust to sub-pixel Y variation within a bubble.
+  const bandHalf = Math.max(2, Math.round(r * 0.4)); // ±40% of radius vertically
+
   let bestOffset = 0;
-  let bestDarkness = -1;
+  let bestScore  = -1;
+  const scores   = [];
 
   for (let offset = -ROW_SNAP_SEARCH_RADIUS; offset <= ROW_SNAP_SEARCH_RADIUS; offset++) {
     const testCy = expectedCy + offset;
-    if (testCy < 0 || testCy >= W) continue;
+    if (testCy < bandHalf || testCy >= H - bandHalf) continue;
 
-    // Scan horizontal band at this y — count dark pixels across all bubble x positions
-    let darkness = 0;
+    let score = 0;
     for (const cx of bubbleXs) {
-      for (let dx = -inkR; dx <= inkR; dx++) {
-        const px = Math.round(cx) + dx;
-        if (px < 0 || px >= W) continue;
-        const v = gray[testCy * W + px];
-        // Invert: darkness = how dark (255 = white → 0 darkness, 0 = black → 255 darkness)
-        darkness += (255 - v);
+      // Sample a small rectangle around (cx, testCy)
+      for (let dy = -bandHalf; dy <= bandHalf; dy++) {
+        const py = testCy + dy;
+        if (py < 0 || py >= H) continue;
+        for (let dx = -inkR; dx <= inkR; dx++) {
+          const px = Math.round(cx) + dx;
+          if (px < 0 || px >= W) continue;
+          score += (255 - gray[py * W + px]);
+        }
       }
     }
-
-    if (darkness > bestDarkness) {
-      bestDarkness = darkness;
-      bestOffset = offset;
-    }
+    scores.push({ offset, score });
+    if (score > bestScore) { bestScore = score; bestOffset = offset; }
   }
 
-  // Only snap if the best offset has meaningful darkness (real ink, not paper noise)
-  const bandWidth = inkR * 2 * bubbleXs.length;
-  const darkFrac = bestDarkness / (bandWidth * 255);
+  // Only snap if:
+  // 1. Best score represents meaningful ink (darkFrac threshold)
+  // 2. The best offset is meaningfully better than offset=0 (prevents drift on blank rows)
+  const sampleArea = (inkR * 2) * (bandHalf * 2 + 1) * bubbleXs.length;
+  const darkFrac   = bestScore / (sampleArea * 255);
 
-  // If we didn't find any real ink, don't drift away from expected position
-  if (darkFrac < ROW_SNAP_MIN_DARK_FRAC || Math.abs(bestOffset) === 0) {
-    return expectedCy; // no snap needed or no ink found
+  const scoreAtZero = scores.find(s => s.offset === 0)?.score ?? 0;
+  const improvement = scoreAtZero > 0 ? bestScore / scoreAtZero : 1;
+
+  // Require: ink present AND snap is at least 15% better than no-snap
+  if (darkFrac < ROW_SNAP_MIN_DARK_FRAC || improvement < 1.15) {
+    return expectedCy;
   }
 
   return expectedCy + bestOffset;
@@ -1763,20 +1762,16 @@ function classifyQuestion(fills, fillFloor, blankStd, qNum) {
     doubleRatio >= DOUBLE_MARK_RATIO;
 
   if (isDoubleCandidate) {
-    // RESOLVE: pick the darker one — it's almost certainly the real answer.
-    // Only flag isDouble=true if the margin is truly microscopic (< 1.5% absolute).
-    // The old 3% threshold caused real answers (margin 1-3%) to be blanked.
-    // At 1.5%, only fills that are essentially identical (e.g. 86.2 vs 86.0) are flagged.
+    // v9.2: ALWAYS resolve to the darker bubble — never return blank for double-mark.
+    // Rationale: ballpen students often press harder on their real answer, or lightly
+    // touched a bubble before changing their mind. The darker fill = intent.
+    // Even if fills are 98.4% vs 98.2% (margin=0.2%), one IS darker — pick it.
+    // Returning blank forces manual review which defeats the purpose of auto-grading.
     const absoluteMargin = best.f - second.f;
-    if (absoluteMargin < 0.015) {
-      // Genuinely ambiguous — flag as double (blank) so student can review
-      console.log(`[BubbleOMR] Q${qNum}: TRUE DOUBLE (top=${(best.f*100).toFixed(1)}% 2nd=${(second.f*100).toFixed(1)}% margin=${(absoluteMargin*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
-      return { answer: '', confidence: 0, isDouble: true, isBlank: false };
-    }
-    // One is clearly darker — resolve to it (most common case with ballpen)
     const letter = OPTIONS[best.i];
-    console.log(`[BubbleOMR] Q${qNum}: ${letter} (resolved double: top=${(best.f*100).toFixed(1)}% 2nd=${(second.f*100).toFixed(1)}% margin=${(absoluteMargin*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
-    return { answer: letter, confidence: rawConfidence * 0.80, isDouble: false, isBlank: false };
+    const confMult = absoluteMargin < 0.015 ? 0.60 : 0.80; // lower conf for near-identical
+    console.log(`[BubbleOMR] Q${qNum}: ${letter} (double→resolved top=${(best.f*100).toFixed(1)}% 2nd=${(second.f*100).toFixed(1)}% margin=${(absoluteMargin*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
+    return { answer: letter, confidence: rawConfidence * confMult, isDouble: false, isBlank: false };
   }
 
   // Case 3: Normal — pick the top bubble
@@ -1924,8 +1919,8 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
       // Bubble X positions for all 4 options
       const bubbleXs = [0,1,2,3].map(i => bubbleX0 + i * layout.BUBBLE_STEP * W);
 
-      // FIX 2: Dynamic row recalibration — snap Y to nearest real ink peak
-      const snappedCy = snapRowY(gray, W, expectedCy, bubbleXs, r);
+      // v9.2: Dynamic row recalibration — snap Y to nearest real ink peak
+      const snappedCy = snapRowY(gray, W, H, expectedCy, bubbleXs, r);
 
       // Sample all 4 bubbles with center-weighted sampler (FIX 1)
       allRatios[qNum] = bubbleXs.map(cx =>
@@ -1947,10 +1942,10 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
     perQMinRatios.reduce((s, v) => s + (v - blankMean) ** 2, 0) / (perQMinRatios.length || 1)
   );
 
-  // Cap fillFloor at 0.22 — v9.1 fix: 30% cap was blocking real ballpen answers
-  // that read as low as 12-25% fill due to perspective distortion and shadows.
+  // Cap fillFloor at 0.30 — phone lighting can push blank reads to 14%+16% std=47% floor
+  // which blocks real ballpen answers (25-40% fill). Hard cap at 30%.
   const rawFloor = blankMean + OMR_CONSTANTS.BLANK_SIGMA_MULT * blankStd;
-  const FILL_FLOOR = Math.max(0.06, Math.min(0.22, rawFloor));
+  const FILL_FLOOR = Math.max(0.06, Math.min(0.30, rawFloor));
   const sorted90   = [...allRatioValues].sort((a, b) => a - b);
   const p90        = sorted90[Math.floor(sorted90.length * 0.90)] ?? 0;
 
@@ -2356,37 +2351,24 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice' || examType === 'mc';
   const isWritten = !isMcType;
 
-  // ── Route bubble_omr: Jimp PRIMARY, Groq as hallucination-guarded fallback ──
-  // v9.1: Jimp pixel detector is primary. Groq only runs if Jimp fails.
-  // Groq hallucination guard rejects results where >50% answers are same letter
-  // or 8+ identical answers appear consecutively.
-
-  function isGroqHallucinating(answers, questionCount) {
-    const vals = Object.values(answers).filter(a => a !== '');
-    if (vals.length < Math.ceil(questionCount * 0.30)) return false;
-    const freq = {};
-    for (const v of vals) freq[v] = (freq[v] || 0) + 1;
-    const maxFreq = Math.max(...Object.values(freq));
-    if (maxFreq / vals.length > 0.50) {
-      const letter = Object.keys(freq).find(k => freq[k] === maxFreq);
-      console.warn(`[Groq Guard] HALLUCINATION — "${letter}" in ${(maxFreq/vals.length*100).toFixed(0)}% of answers. Rejecting.`);
-      return true;
-    }
-    const arr = Object.entries(answers).sort((a,b)=>parseInt(a[0])-parseInt(b[0])).map(([,v])=>v);
-    let run = 1, maxRun = 1;
-    for (let i = 1; i < arr.length; i++) {
-      if (arr[i] !== '' && arr[i] === arr[i-1]) { run++; maxRun = Math.max(maxRun, run); } else run = 1;
-    }
-    if (maxRun >= 8) {
-      console.warn(`[Groq Guard] SUSPICIOUS RUN of ${maxRun} identical answers. Rejecting.`);
-      return true;
-    }
-    return false;
-  }
-
+  // ── Route bubble_omr: Groq AI vision FIRST, Jimp pixel detector as fallback ──
+  // ARCHITECTURE CHANGE v8.2:
+  // Groq vision (AI) is now the PRIMARY engine for bubble sheets.
+  // Reason: Jimp pixel detection requires perfect overhead alignment + calibrated
+  // grid constants. Phone photos taken at even slight angles cause grid drift that
+  // makes Jimp sample the wrong bubbles — producing wrong answers even though it
+  // "finds" 40-50 bubbles (so the fallback never triggers).
+  //
+  // Groq vision SEES the actual filled bubble visually — it works regardless of:
+  //   - Camera angle / perspective
+  //   - Slight grid misalignment
+  //   - Varying lighting / shadows
+  //   - Different sheet prints (slight scaling differences)
+  //
+  // Jimp pixel detector is kept as fallback for when Groq is unavailable.
 if (isBubble) {
 
-  // Pre-process: preserve grayscale detail for pixel-level analysis
+  // Pre-process: maximise contrast without destroying grayscale gradients.
   let processedBase64 = imageBase64;
   let processedMime   = mimeType || 'image/jpeg';
   if (sharp) {
@@ -2395,10 +2377,10 @@ if (isBubble) {
       const processed = await sharp(inputBuf)
         .rotate()
         .greyscale()
-        .modulate({ brightness: 1.05 })
+        .modulate({ brightness: 1.10, contrast: 1.15 })
         .normalise()
         .median(3)
-        .sharpen({ sigma: 1.0, m1: 0.8, m2: 0.3 })
+        .sharpen({ sigma: 1.2, m1: 1.0, m2: 0.5 })
         .png()
         .toBuffer();
       processedBase64 = processed.toString('base64');
@@ -2409,61 +2391,34 @@ if (isBubble) {
     }
   }
 
-  // PRIMARY: Jimp pixel detector
-  console.log('[AutoChecker] v9.1 — Bubble OMR: Jimp pixel detector PRIMARY');
-  let jimpResult = null;
-  try {
-    jimpResult = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
-    const minAcceptable = Math.ceil(questionCount * 0.40);
-    if (jimpResult && jimpResult.answeredCount >= minAcceptable && jimpResult.confidence >= 0.35) {
-      console.log(`[AutoChecker] Jimp PRIMARY — ${jimpResult.answeredCount}/${questionCount} answered, conf=${((jimpResult.confidence||0)*100).toFixed(1)}% ✓`);
-
-      // Groq cross-check: fill only Jimp blanks (never overwrite answered questions)
-      if (groqReady && jimpResult.answeredCount < questionCount) {
-        const blankQs = Object.entries(jimpResult.answers).filter(([,v])=>v==='').map(([k])=>parseInt(k));
-        if (blankQs.length > 0 && blankQs.length <= Math.ceil(questionCount * 0.30)) {
-          console.log(`[AutoChecker] Groq cross-check for ${blankQs.length} Jimp blanks...`);
-          try {
-            const groqResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount);
-            if (groqResult && !isGroqHallucinating(groqResult.answers, questionCount)) {
-              let filled = 0;
-              for (const qNum of blankQs) {
-                const k = String(qNum);
-                const v = groqResult.answers[k];
-                if (v && ['A','B','C','D'].includes(v.toUpperCase())) { jimpResult.answers[k] = v.toUpperCase(); filled++; }
-              }
-              if (filled > 0) { jimpResult.answeredCount += filled; console.log(`[AutoChecker] Groq filled ${filled} Jimp blanks`); }
-            }
-          } catch (groqErr) { console.warn('[AutoChecker] Groq cross-check failed (non-fatal):', groqErr.message); }
-        }
-      }
-      return jimpResult;
-    }
-    console.warn(`[AutoChecker] Jimp only ${jimpResult?.answeredCount ?? 0}/${questionCount} or low conf — trying Groq fallback`);
-  } catch (err) {
-    console.warn('[AutoChecker] Jimp error:', err.message);
-  }
-
-  // FALLBACK: Groq (with hallucination guard)
+  // PRIMARY: Groq AI vision — reads filled bubbles visually, angle-tolerant
   if (groqReady) {
     try {
-      console.log('[AutoChecker] Groq AI vision FALLBACK');
+      console.log('[AutoChecker] v8.2 — Bubble OMR: trying Groq AI vision FIRST (primary)');
       const groqResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount);
-      if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.40)) {
-        if (isGroqHallucinating(groqResult.answers, questionCount)) {
-          console.warn('[AutoChecker] Groq fallback rejected (hallucination). Returning Jimp result.');
-          return jimpResult ?? { studentName: null, answers: buildEmptyAnswers(questionCount), answeredCount: 0, engineConfidence: 0, confidence: 0 };
-        }
-        console.log(`[AutoChecker] Groq FALLBACK — ${groqResult.answeredCount}/${questionCount} ✓`);
+      if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
+        console.log(`[AutoChecker] Groq AI vision PRIMARY — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
         return groqResult;
       }
-    } catch (err) { console.warn('[AutoChecker] Groq fallback failed:', err.message); }
+      console.warn(`[AutoChecker] Groq returned only ${groqResult?.answeredCount ?? 0}/${questionCount} — trying Jimp fallback`);
+    } catch (err) {
+      console.warn('[AutoChecker] Groq primary failed, falling back to Jimp:', err.message);
+    }
   }
 
-  if (jimpResult && jimpResult.answeredCount > 0) {
-    console.warn('[AutoChecker] Returning partial Jimp result');
-    return jimpResult;
+  // FALLBACK: Jimp pixel detector (when Groq unavailable or returns too few)
+  try {
+    const jimpResult = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
+    const minAcceptable = Math.ceil(questionCount * 0.20);
+    if (jimpResult && jimpResult.answeredCount >= minAcceptable) {
+      console.log(`[AutoChecker] Jimp pixel detection fallback — ${jimpResult.answeredCount}/${questionCount} bubbles ✓`);
+      return jimpResult;
+    }
+    console.warn(`[AutoChecker] Jimp found only ${jimpResult?.answeredCount ?? 0}/${questionCount}`);
+  } catch (err) {
+    console.warn('[AutoChecker] Jimp detection error:', err.message);
   }
+
   console.log('[AutoChecker] All bubble engines failed — returning empty result');
 }
 
@@ -3472,7 +3427,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '9.1-calibrated-rowsnap-secondpass-fix',
+  version: '8.4-scan-bubbles-local-processor',
 }));
 
 // Error handler
@@ -3494,4 +3449,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v91-rowsnap-secondpass-calibration-fix
+// redeploy-trigger-20260526-v84-scan-bubbles-local-processorS
