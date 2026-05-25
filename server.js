@@ -1336,36 +1336,41 @@ const MARK_INSET = 27; // registration mark centre inset from paper edge (px)
 //    a visual overlay. Adjust Q_NUM_W and COL_LEFT until circles land on bubbles.
 
 const OMR_LAYOUT = {
-  // ── ALL VALUES EXACT from omrConfig.ts v5.4 ──────────────────────────────
-  // PAGE_W=794 PAGE_H=1123 PAPER_PAD=12 OUTER_PAD=33 HEADER_H=132
-  // gridTop = 12+132+33 = 177px   COL_HEADER_H=24px
-  // firstRowCy = 177+24+15 = 216px   GRID_TOP = 201/1123 = 0.1790
-  // BUBBLE_W=18 BUBBLE_H=18 BUBBLE_GAP=8 → BUBBLE_STEP=26px=0.0327
-  // BUBBLE_R = 9px = 0.0113   ROW_H=30 → ROW_STEP=0.0267
+  // ── VALUES VERIFIED FROM LIVE SCAN LOGS (empirical ground truth) ─────────
+  // PAGE_W=794 PAGE_H=1123  GRID_TOP=0.1790  ROW_STEP=0.0267
+  //
+  // KEY FINDING: real BUBBLE_STEP = 52px (not 26px from omrConfig BUBBLE_W+GAP).
+  // omrConfig BUBBLE_W=18, BUBBLE_GAP=8 → naive step=26, but the renderer adds
+  // extra spacing (cell-based layout), making the printed step = 52px.
+  //
+  // Verified from log: col1 ink at A(96px) and our-C(148px=96+52) → step=52 ✓
+  //                    col2 ink at our-B(475px) and our-D(527px=475+52) → step=52 ✓
+  //
+  // COL_LEFT[1] for 2-col: real col2 bubble-A = 423px (= 475-52)
+  //   COL_LEFT[1] = (423-51)/794 = 0.4685
+  //
+  // BUBBLE_R = 9px = 0.0113 (half of BUBBLE_H=18, confirmed by r=9px in logs)
 
   // 1-column (≤25 questions)
-  // colInnerW=704px  qNumW=36  qNumOffset=6+36+2+9=53px=0.0668
-  // bubbleA_x = 45+53 = 98px
   1: {
     GRID_TOP:    0.1790,
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
     COL_LEFT:    [0.0567],
-    Q_NUM_W:     0.0668,
-    BUBBLE_STEP: 0.0327,
+    Q_NUM_W:     0.0642,
+    BUBBLE_STEP: 0.0655,
   },
 
-  // 2-column (26–50 questions)
-  // colInnerW=351.5px  qNumW=34  qNumOffset=6+34+2+9=51px=0.0642
-  // COL_LEFT[0]=45px=0.0567  COL_LEFT[1]=397.5px=0.5006
-  // bubbleA centres: Col0=96px  Col1=449px
+  // 2-column (26–50 questions) — VERIFIED from live scan logs
+  // Col0 bubble centres: A=96  B=148  C=200  D=252
+  // Col1 bubble centres: A=423 B=475  C=527  D=579
   2: {
     GRID_TOP:    0.1790,
     ROW_STEP:    0.0267,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0567, 0.5006],
+    COL_LEFT:    [0.0567, 0.4685],
     Q_NUM_W:     0.0642,
-    BUBBLE_STEP: 0.0327,
+    BUBBLE_STEP: 0.0655,
   },
 
   // 3-column (51–100 questions)
@@ -1414,7 +1419,7 @@ const OMR_LAYOUT = {
     BUBBLE_R:    0.0113,
     COL_LEFT:    [0.0567, 0.3526, 0.6486],
     Q_NUM_W:     0.0592,
-    BUBBLE_STEP: 0.0327,
+    BUBBLE_STEP: 0.0655,
   },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
@@ -3121,4 +3126,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260525-omr-all-layouts-exact-threshold-fix-v10
+// redeploy-trigger-20260525-omr-step52-empirical-verified-v11
