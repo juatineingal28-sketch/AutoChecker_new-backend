@@ -1358,18 +1358,52 @@ const OMR_LAYOUT = {
   },
 
   // 3-column (51–100 questions)
-  // Scaled from 2-col measurements: col_width_3col/col_width_2col = 0.6668
-  // COL_LEFT[2] was 0.7000 (wrong guess) → corrected to 0.6668
-  // Q_NUM_W was 0.1310 (2-col value) → corrected to 0.0873 (scaled)
-  // BUBBLE_STEP was 0.1016 (2-col value) → corrected to 0.0680 (scaled)
-  // GRID_TOP corrected for 75Q row height (24px vs 30px for 50Q)
+  // RE-CALIBRATED v6 for AutoChecker 75Q sheet (EXAM-20260517-DHS2 style)
+  //
+  // Measured from the printed AutoChecker sheet photo:
+  //   PAGE_W=794, PAGE_H=1123 (canonical A4 @ 96dpi after perspective correction)
+  //
+  //   Header block (title + name/section/date row + subject/test row + directions + exam-id bar)
+  //   visually ends at ≈ 195px from top.
+  //   OUTER_PAD = 33px  →  gridTop = 195 + 33 = 228px
+  //   GRID_TOP  = 228/1123 = 0.2030
+  //
+  //   Column header row (A B C D labels) height ≈ 20px
+  //   firstRowCy = gridTop + colHeaderH + rowH/2 = 228 + 20 + 12 = 260px
+  //   GRID_TOP_fraction = (firstRowCy - rowH/2) / 1123 = 248/1123 = 0.2208
+  //
+  //   3-col layout: each column width = (794 - 2*GRID_LEFT_OFFSET - 2*COL_SEP) / 3
+  //     GRID_LEFT_OFFSET ≈ 38px, COL_SEP = 1px
+  //     colW = (794 - 76 - 2) / 3 = 238.7px
+  //
+  //   Column left edges (content area):
+  //     Col0: 38px                   → 38/794  = 0.0479
+  //     Col1: 38 + 238.7 + 1 = 277.7 → 277.7/794 = 0.3498
+  //     Col2: 277.7 + 238.7 + 1 = 517.4 → 517.4/794 = 0.6517
+  //
+  //   qNumW for 75Q ≈ 28px (narrower than 50Q's 34px — fewer digit chars needed)
+  //   COL_PAD_H = 6px, BUBBLE_MARGIN = 2px
+  //   Q_NUM_W = (COL_PAD_H + qNumW + BUBBLE_MARGIN + bubbleW/2) / PAGE_W
+  //           = (6 + 28 + 2 + 9) / 794 = 45/794 = 0.0566
+  //
+  //   bubbleW = 18px, BUBBLE_GAP = 8px  →  bubbleStep = 26px
+  //   BUBBLE_STEP = 26/794 = 0.0327   (but 3-col is narrower, bubbleW shrinks)
+  //   For 75Q, bubbles scale down: bubbleW ≈ 14px, gap ≈ 6px → step = 20px
+  //   BUBBLE_STEP = 20/794 = 0.0252
+  //
+  //   rowH for 75Q = floor((1123 - gridTop - bottomPad) / 25) ≈ 24px
+  //   ROW_STEP = 24/1123 = 0.0214   (same as before, this was correct)
+  //   BUBBLE_R = 7/794 = 0.0088
+  //
+  // If bubbles still miss: use POST /api/omr-debug to generate a visual overlay,
+  // then nudge COL_LEFT values until circles land on the printed bubbles.
   3: {
-    GRID_TOP:    0.1870,
+    GRID_TOP:    0.2208,
     ROW_STEP:    0.0214,
-    BUBBLE_R:    0.0101,
-    COL_LEFT:    [0.0000, 0.3334, 0.6668],
-    Q_NUM_W:     0.0873,
-    BUBBLE_STEP: 0.0680,
+    BUBBLE_R:    0.0088,
+    COL_LEFT:    [0.0479, 0.3498, 0.6517],
+    Q_NUM_W:     0.0566,
+    BUBBLE_STEP: 0.0252,
   },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
@@ -3041,7 +3075,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '5.0-omr-ground-truth-fix',
+  version: '5.1-omr-3col-recalibrated',
 }));
 
 // Error handler
@@ -3063,4 +3097,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260518-omr-layout-recalibrated-v6
+// redeploy-trigger-20260525-omr-3col-recalibrated-v7
