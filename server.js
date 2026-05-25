@@ -2201,6 +2201,28 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
   try {
     console.log(`[Groq] Scanning ${examType} — ${rangeDesc}`);
 
+    // ── Compress image before sending to Groq ────────────────────────────────
+    // Groq rejects images larger than ~4MB (413 error). Phone photos are often
+    // 3120×4160px (13MP) = 12–20MB base64. Resize to max 1600px on longest side.
+    let groqImageBase64 = imageBase64;
+    let groqMimeType    = mimeType || 'image/jpeg';
+    if (sharp) {
+      try {
+        const inputBuf = Buffer.from(imageBase64, 'base64');
+        const compressed = await sharp(inputBuf)
+          .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+        groqImageBase64 = compressed.toString('base64');
+        groqMimeType    = 'image/jpeg';
+        const origKB = Math.round(imageBase64.length * 0.75 / 1024);
+        const compKB = Math.round(compressed.length / 1024);
+        console.log(`[Groq] Image compressed: ${origKB}KB → ${compKB}KB`);
+      } catch (compErr) {
+        console.warn('[Groq] Image compression failed, using original:', compErr.message);
+      }
+    }
+
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method:  'POST',
       headers: {
@@ -2214,7 +2236,7 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
           role: 'user',
           content: [
             { type: 'text',      text: prompt },
-            { type: 'image_url', image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${imageBase64}` } },
+            { type: 'image_url', image_url: { url: `data:${groqMimeType};base64,${groqImageBase64}` } },
           ],
         }],
       }),
@@ -3321,7 +3343,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '8.2-groq-primary-bubble-omr',
+  version: '8.3-groq-compress-fix413',
 }));
 
 // Error handler
@@ -3343,4 +3365,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v82-groq-primary-bubble-omr
+// redeploy-trigger-20260526-v83-groq-image-compress-fix413
