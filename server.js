@@ -1588,7 +1588,7 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
   }
 
   // Reject blobs too small (noise) OR too large (image border/header line — not a reg mark)
-  if (bestArea < 30 || bestArea > 20000) return null;
+  if (bestArea < 20 || bestArea > 25000) return null;
   return { cx: bestSumX / bestArea, cy: bestSumY / bestArea };
 }
 
@@ -1597,12 +1597,29 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
 // (Old value was 10% which was too small for some phone aspect ratios.)
 const searchW = Math.round(imgW * 0.22);
 const searchH = Math.round(imgH * 0.22);
-const cornerThr = Math.round(otsuThreshold(gray) * 0.85); // NO cap — relative to image brightness
 
-const tlBlob = findCornerBlob(gray, imgW, imgH, 0, 0, searchW, searchH, cornerThr);
-const trBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, 0, imgW, searchH, cornerThr);
-const brBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, imgH - searchH, imgW, imgH, cornerThr);
-const blBlob = findCornerBlob(gray, imgW, imgH, 0, imgH - searchH, searchW, imgH, cornerThr);
+// Multi-threshold retry: try progressively lower thresholds until all 4 corners found.
+// Root cause of previous failures: Otsu on a bright white sheet gives ~94,
+// then *0.85 = 80, but the corner squares on this specific sheet are only slightly
+// darker than the paper, so we need to try down to *0.60 to reliably find them.
+let tlBlob = null, trBlob = null, brBlob = null, blBlob = null;
+let cornerThr = 0;
+const otsuBase = otsuThreshold(gray);
+for (const factor of [0.85, 0.75, 0.65, 0.55, 0.45]) {
+  const thr = Math.round(otsuBase * factor);
+  const tl = findCornerBlob(gray, imgW, imgH, 0,            0,            searchW,      searchH,      thr);
+  const tr = findCornerBlob(gray, imgW, imgH, imgW-searchW, 0,            imgW,         searchH,      thr);
+  const br = findCornerBlob(gray, imgW, imgH, imgW-searchW, imgH-searchH, imgW,         imgH,         thr);
+  const bl = findCornerBlob(gray, imgW, imgH, 0,            imgH-searchH, searchW,      imgH,         thr);
+  const found = [tl,tr,br,bl].filter(Boolean).length;
+  console.log(`[BubbleOMR] cornerThr=${thr} (factor=${factor}) → TL:${tl?'✓':'✗'} TR:${tr?'✓':'✗'} BR:${br?'✓':'✗'} BL:${bl?'✓':'✗'}`);
+  if (found > [tlBlob,trBlob,brBlob,blBlob].filter(Boolean).length) {
+    tlBlob = tl || tlBlob; trBlob = tr || trBlob;
+    brBlob = br || brBlob; blBlob = bl || blBlob;
+    cornerThr = thr;
+  }
+  if (tlBlob && trBlob && brBlob && blBlob) break;
+}
 console.log(`[BubbleOMR] Image size: ${imgW}×${imgH}, searchRegion: ${searchW}×${searchH}, cornerThr: ${cornerThr}`);
 console.log(`[BubbleOMR] Corner blobs — TL:${tlBlob?'✓':'✗'} TR:${trBlob?'✓':'✗'} BR:${brBlob?'✓':'✗'} BL:${blBlob?'✓':'✗'}`);
 
