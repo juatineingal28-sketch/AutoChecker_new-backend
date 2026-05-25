@@ -2457,77 +2457,244 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   // Jimp pixel detector is kept as fallback for when Groq is unavailable.
 if (isBubble) {
 
-  // Pre-process bubble sheet: enhance contrast so filled bubbles are clearly dark.
-  // IMPORTANT: Keep as JPEG (not PNG) — PNG is 5-10x larger and forces Groq to
-  // compress it down to ~370KB, destroying all the detail we need to read bubbles.
-  // We pre-resize to 2400px here so that when scanWithGroq compresses it, it
-  // stays at a usable resolution rather than being crushed.
+  // ── Step 1: Pre-process the full image ──────────────────────────────────────
+  // Keep JPEG (not PNG) — PNG is 5-10x larger and forces Groq to crush it.
+  // Normalise contrast so filled bubbles are clearly darker than empty ones.
+  let processedBuf    = null;
   let processedBase64 = imageBase64;
   let processedMime   = mimeType || 'image/jpeg';
+
   if (sharp) {
     try {
       const inputBuf = Buffer.from(imageBase64, 'base64');
-      const processed = await sharp(inputBuf)
-        .rotate()                                        // auto-correct EXIF orientation
+      processedBuf = await sharp(inputBuf)
+        .rotate()                                         // auto-correct EXIF orientation
         .resize(2400, 2400, { fit: 'inside', withoutEnlargement: true })
-        .modulate({ brightness: 1.05 })                 // slight lift for dark photos
-        .normalise()                                     // stretch contrast to full range
-        .sharpen({ sigma: 0.8, m1: 0.5, m2: 0.2 })     // mild sharpen — crisp bubble edges
-        .jpeg({ quality: 92 })                          // JPEG: small but high quality
+        .modulate({ brightness: 1.05 })
+        .normalise()
+        .sharpen({ sigma: 0.8, m1: 0.5, m2: 0.2 })
+        .jpeg({ quality: 92 })
         .toBuffer();
-      processedBase64 = processed.toString('base64');
+      processedBase64 = processedBuf.toString('base64');
       processedMime   = 'image/jpeg';
-      const kb = Math.round(processed.length / 1024);
-      console.log(`[AutoChecker] Bubble image pre-processed: ${kb}KB JPEG ✓`);
+      const kb = Math.round(processedBuf.length / 1024);
+      console.log(`[AutoChecker] Bubble pre-processed: ${kb}KB JPEG ✓`);
     } catch (e) {
       console.warn('[AutoChecker] sharp pre-processing failed:', e.message);
     }
   }
 
-  // ── Hallucination guard: detect if Groq defaulted to one letter ─────────────
-  // If >60% of answers are the same letter, Groq likely hallucinated.
-  // Retry once with an even more emphatic prompt segment injected.
-  function detectHallucination(answers, total) {
-    const counts = { A: 0, B: 0, C: 0, D: 0 };
-    for (const v of Object.values(answers)) {
-      if (counts[v] !== undefined) counts[v]++;
+  // ── Step 2: Column-strip splitter ──────────────────────────────────────────
+  // ROOT CAUSE FIX: Groq reads the first column correctly, then loses attention
+  // over the rest of a dense 50-question sheet. Solution: crop the image into
+  // one vertical strip per column and scan each strip independently.
+  // Each strip has only 25 rows — Groq handles that reliably.
+  //
+  // AutoChecker sheet layout (from the actual printed sheet):
+  //   Header row at top ~14% of image height
+  //   2 columns for 50Q, 3 columns for 75Q
+  //   Each column occupies ~50% (2-col) or ~33% (3-col) of image width
+  //
+  // We add a 3% overlap on left/right edges to avoid clipping bubble outlines.
+
+  async function cropColumnStrip(fullBuf, colIndex, totalCols) {
+    if (!sharp || !fullBuf) return null;
+    try {
+      const meta      = await sharp(fullBuf).metadata();
+      const imgW      = meta.width;
+      const imgH      = meta.height;
+
+      // Header (student name, directions) takes ~14% of height — skip it
+      const headerFrac = 0.14;
+      const topY       = Math.floor(imgH * headerFrac);
+      const cropH      = imgH - topY;
+
+      // Each column width with 3% overlap on each side
+      const colFrac    = 1 / totalCols;
+      const overlapFrac = 0.03;
+      const rawLeft    = colIndex * colFrac;
+      const left       = Math.max(0, Math.floor(imgW * (rawLeft - overlapFrac)));
+      const right      = Math.min(imgW, Math.floor(imgW * (rawLeft + colFrac + overlapFrac)));
+      const cropW      = right - left;
+
+      const stripBuf = await sharp(fullBuf)
+        .extract({ left, top: topY, width: cropW, height: cropH })
+        .jpeg({ quality: 93 })
+        .toBuffer();
+
+      const kb = Math.round(stripBuf.length / 1024);
+      console.log(`[AutoChecker] Column ${colIndex + 1}/${totalCols} strip: ${kb}KB (x=${left}-${right}, y=${topY}-${imgH})`);
+      return stripBuf;
+    } catch (e) {
+      console.warn(`[AutoChecker] Column strip ${colIndex} failed:`, e.message);
+      return null;
     }
-    const maxCount  = Math.max(...Object.values(counts));
-    const maxLetter = Object.keys(counts).find(k => counts[k] === maxCount);
-    const ratio     = total > 0 ? maxCount / total : 0;
-    return { isHallucinated: ratio > 0.60, dominantLetter: maxLetter, ratio };
   }
 
-  // PRIMARY: Groq AI vision — reads filled bubbles visually, angle-tolerant
+  // Hallucination guard — if >55% same letter in a strip, it's still wrong
+  function detectHallucination(answers) {
+    const vals  = Object.values(answers).filter(v => ['A','B','C','D'].includes(v));
+    if (vals.length === 0) return { isHallucinated: false };
+    const counts = { A: 0, B: 0, C: 0, D: 0 };
+    for (const v of vals) counts[v]++;
+    const maxCount  = Math.max(...Object.values(counts));
+    const maxLetter = Object.keys(counts).find(k => counts[k] === maxCount);
+    const ratio     = maxCount / vals.length;
+    return { isHallucinated: ratio > 0.55, dominantLetter: maxLetter, ratio };
+  }
+
+  // Scan one column strip: send ONLY that strip + its question range to Groq
+  async function scanColumnStrip(stripBuf, fromQ, toQ, colIdx) {
+    if (!groqReady || !stripBuf) return null;
+
+    const stripBase64 = stripBuf.toString('base64');
+    const colCount    = toQ - fromQ + 1;
+
+    const stripPrompt =
+`You are reading ONE COLUMN of a bubble answer sheet.
+This image shows ONLY questions ${fromQ} to ${toQ} (${colCount} rows).
+Each row has 4 circles: A  B  C  D  (left to right). The question number is on the left.
+
+HOW TO IDENTIFY THE FILLED BUBBLE:
+✅ FILLED = the interior/center of the circle is SOLID BLACK or heavily shaded.
+❌ EMPTY  = just a thin ring outline with a white center — do NOT pick these.
+
+FOR EVERY ROW:
+1. Look at all 4 circles in that row.
+2. Compare their centers — 3 will be white/light, 1 will be dark.
+3. Report the letter of the ONE with the dark center.
+4. If genuinely none are filled, use "".
+
+⚠️  WARNING: Do NOT return the same letter for most rows. Real sheets vary.
+    If you find yourself writing the same letter repeatedly, STOP and look again.
+    Each row is independent — the filled bubble is in a different position per question.
+
+Return ONLY a JSON object for questions ${fromQ}–${toQ}:
+{"${fromQ}":"C","${fromQ + 1}":"A","${fromQ + 2}":"D",...,"${toQ}":"B"}
+No explanation. No markdown. Only the JSON.`;
+
+    try {
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method:  'POST',
+        headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model:       'meta-llama/llama-4-scout-17b-16e-instruct',
+          max_tokens:  600,
+          temperature: 0,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text',      text: stripPrompt },
+              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${stripBase64}` } },
+            ],
+          }],
+        }),
+      });
+
+      if (!response.ok) {
+        console.warn(`[AutoChecker] Column ${colIdx} Groq HTTP ${response.status}`);
+        return null;
+      }
+
+      const data    = await response.json();
+      const rawText = (data.choices?.[0]?.message?.content ?? '').trim();
+      console.log(`[AutoChecker] Col${colIdx} raw: ${rawText.slice(0, 150)}`);
+
+      const jsonMatch = rawText.replace(/```json|```/g, '').trim().match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return null;
+      const parsed  = JSON.parse(jsonMatch[0]);
+
+      const answers = {};
+      for (let i = fromQ; i <= toQ; i++) {
+        const v = (parsed[String(i)] ?? '').trim().toUpperCase();
+        answers[String(i)] = ['A','B','C','D'].includes(v) ? v : '';
+      }
+
+      const guard = detectHallucination(answers);
+      if (guard.isHallucinated) {
+        console.warn(`[AutoChecker] Col${colIdx} hallucination: ${(guard.ratio*100).toFixed(0)}% "${guard.dominantLetter}" — will retry this column`);
+        return null; // signal to retry with full-image fallback
+      }
+
+      const answered = Object.values(answers).filter(v => v !== '').length;
+      console.log(`[AutoChecker] Col${colIdx} ✓ — ${answered}/${colCount} answered`);
+      return answers;
+
+    } catch (e) {
+      console.warn(`[AutoChecker] Col${colIdx} scan error:`, e.message);
+      return null;
+    }
+  }
+
+  // PRIMARY: Column-strip scan with Groq
   if (groqReady) {
     try {
-      console.log('[AutoChecker] v8.3 — Bubble OMR: Groq AI vision PRIMARY');
-      let groqResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount);
+      console.log('[AutoChecker] v8.4 — Bubble OMR: column-strip scan');
 
-      if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
-        // Check for hallucination (all/mostly same letter)
-        const guard = detectHallucination(groqResult.answers, groqResult.answeredCount);
-        if (guard.isHallucinated) {
-          console.warn(`[AutoChecker] Hallucination detected — ${(guard.ratio * 100).toFixed(0)}% are "${guard.dominantLetter}". Retrying with stricter prompt…`);
-          // Retry: inject a hallucination-breaking prefix into the prompt by
-          // temporarily patching the typeInstructions for this call only.
-          groqResult = await scanWithGroqStrict(processedBase64, processedMime, questionCount, guard.dominantLetter);
+      // Determine column count and per-column question ranges
+      const numCols   = questionCount <= 50 ? 2 : 3;
+      const perCol    = Math.ceil(questionCount / numCols);
+      const colRanges = [];
+      for (let c = 0; c < numCols; c++) {
+        const fromQ = c * perCol + 1;
+        const toQ   = Math.min((c + 1) * perCol, questionCount);
+        colRanges.push({ fromQ, toQ, colIdx: c + 1 });
+      }
+
+      // Crop strips (requires processedBuf from sharp)
+      const stripBufs = [];
+      if (processedBuf) {
+        for (const { colIdx } of colRanges) {
+          const buf = await cropColumnStrip(processedBuf, colIdx - 1, numCols);
+          stripBufs.push(buf);
         }
       }
 
-      if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
-        const guard2 = detectHallucination(groqResult.answers, groqResult.answeredCount);
-        if (guard2.isHallucinated) {
-          console.warn(`[AutoChecker] Still hallucinating after retry (${(guard2.ratio * 100).toFixed(0)}% "${guard2.dominantLetter}") — falling back to Jimp`);
-        } else {
-          console.log(`[AutoChecker] Groq AI vision PRIMARY — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
-          return groqResult;
+      // Scan each column — sequentially to avoid rate-limit
+      const mergedAnswers = {};
+      let   allSucceeded  = true;
+
+      for (let c = 0; c < colRanges.length; c++) {
+        const { fromQ, toQ, colIdx } = colRanges[c];
+        const stripBuf = stripBufs[c] ?? null;
+
+        let colAnswers = await scanColumnStrip(stripBuf, fromQ, toQ, colIdx);
+
+        // If column strip failed/hallucinated, retry with full image but restricted range
+        if (!colAnswers) {
+          console.warn(`[AutoChecker] Col${colIdx} strip failed — retrying with full image, range Q${fromQ}-Q${toQ}`);
+          const fullResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount, fromQ, toQ);
+          if (fullResult?.answers) {
+            const guard = detectHallucination(fullResult.answers);
+            if (!guard.isHallucinated) {
+              colAnswers = fullResult.answers;
+            } else {
+              console.warn(`[AutoChecker] Col${colIdx} full-image retry also hallucinated — skipping`);
+              allSucceeded = false;
+            }
+          } else {
+            allSucceeded = false;
+          }
         }
-      } else {
-        console.warn(`[AutoChecker] Groq returned only ${groqResult?.answeredCount ?? 0}/${questionCount} — trying Jimp fallback`);
+
+        if (colAnswers) Object.assign(mergedAnswers, colAnswers);
       }
+
+      const answeredCount = Object.values(mergedAnswers).filter(v => v !== '').length;
+      if (answeredCount >= Math.ceil(questionCount * 0.50)) {
+        console.log(`[AutoChecker] Column-strip scan DONE — ${answeredCount}/${questionCount} bubbles ✓`);
+        return {
+          studentName:      null,
+          answers:          mergedAnswers,
+          answeredCount,
+          engineConfidence: allSucceeded ? 92 : 78,
+          confidence:       allSucceeded ? 0.92 : 0.78,
+        };
+      }
+      console.warn(`[AutoChecker] Column-strip only got ${answeredCount}/${questionCount} — falling back to Jimp`);
+
     } catch (err) {
-      console.warn('[AutoChecker] Groq primary failed, falling back to Jimp:', err.message);
+      console.warn('[AutoChecker] Column-strip scan failed:', err.message);
     }
   }
 
