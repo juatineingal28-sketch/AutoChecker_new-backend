@@ -1655,7 +1655,7 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
   const imgScaleSq = (W / 794) ** 2;
   const minArea = Math.round(20  * imgScaleSq);
   const maxArea = Math.round(180000 * imgScaleSq); // generous: rejects only page-spanning blobs
-  if (bestArea < minArea || bestArea > maxArea || bestCx < 0) return null;
+  if (bestArea < minArea || bestArea > maxArea || bestArea === 0) return null;
   return { cx: bestSumX / bestArea, cy: bestSumY / bestArea };
 }
 
@@ -1893,28 +1893,37 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
 
-    bubble_omr: `This is a BUBBLE SHEET (OMR) exam. The student filled in circles/bubbles to indicate their answers.
+    bubble_omr: `This is an AutoChecker BUBBLE SHEET (OMR) exam. You must carefully identify which bubble is PHYSICALLY FILLED IN for each question.
 
-HOW TO READ A BUBBLE SHEET:
-- Each question row has 4 circles labeled A, B, C, D (left to right).
-- A FILLED bubble = the student's answer. It appears DARKENED, SHADED, or FILLED IN with pen/pencil.
-- An EMPTY bubble = not chosen. It is just an outline circle with a white/light interior.
-- Look for the circle that is darkest / most filled compared to the other 3 in that row.
-- A bubble can be filled with pencil (gray), ballpen (dark), or marker (solid black).
+LAYOUT — READ THIS CAREFULLY:
+- The sheet has columns of questions (e.g. 2 columns: Q1-Q25 on the LEFT, Q26-Q50 on the RIGHT; or 3 columns for 75Q).
+- Each question row shows 4 circles/ovals in order: A  B  C  D  (left to right).
+- The question number appears to the LEFT of the 4 bubbles.
 
-COMMON PATTERNS:
-- Fully filled circle (solid black/dark) = chosen answer
-- Circle with an X or checkmark inside = chosen answer  
-- Heavy pencil shading inside circle = chosen answer
-- Light outline only = NOT chosen
-- Partially erased but still darker than empty = may be chosen (use darkest in row)
+HOW TO IDENTIFY A FILLED BUBBLE:
+✅ FILLED = the inside of the circle is DARK (solid black, dark gray, or heavily shaded).
+   The student used a ballpen or pencil to shade/fill the circle interior.
+✅ Completely filled (solid dark disc) = answer.
+✅ Heavily shaded interior = answer.
+✅ Circle with X, checkmark, or slash inside = answer.
+❌ EMPTY = only a thin circular outline, with a WHITE/LIGHT interior = NOT chosen.
+❌ Do NOT confuse the printed circle border (outline) with a filled bubble.
+❌ Do NOT pick the darkest outline — the INTERIOR must be dark.
 
-COLUMNS: The sheet may have 2 columns side by side (e.g. Q1-Q25 on left, Q26-Q50 on right).
-Read each column top to bottom, then proceed to the next column.
+CRITICAL — DO NOT ASSUME PATTERNS:
+- Questions do NOT all have the same answer. Each row is independent.
+- Look at EACH row separately. The filled bubble position varies per question.
+- A is NOT always the answer. B is NOT always the answer.
+- Compare the 4 bubbles in a row: only the one with a DARK INTERIOR is chosen.
 
-Return ONLY the letter (A, B, C, or D) of the FILLED bubble for each question.
-If NO bubble is clearly filled for a question, return "".
-NEVER guess — only return a letter if one bubble is visibly darker than the other 3.`,
+MULTI-COLUMN SHEETS:
+- LEFT column: Q1 at top going DOWN to Q25 (or Q50 for 1-col sheets).
+- RIGHT column: continues from Q26 downward (or Q51 for 3-col sheets).
+- Read ALL columns. Do not stop at Q25.
+
+Return ONLY the letter (A, B, C, or D) of the bubble whose interior is clearly filled/shaded.
+If NO bubble interior is visibly darker than the others in that row, return "".
+NEVER default to B or any single letter — analyze each row independently.`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -3134,7 +3143,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '5.2-omr-geometry-fix',
+  version: '5.3-omr-bestcx-groq-prompt-fix',
 }));
 
 // Error handler
@@ -3156,4 +3165,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260525-omr-layout-geometry-fix-v12
+// redeploy-trigger-20260525-omr-bestcx-fix-groq-prompt-v13
