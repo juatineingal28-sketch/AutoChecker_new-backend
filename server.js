@@ -1384,15 +1384,37 @@ const OMR_LAYOUT = {
   },
 
   // 2-column (26–50 questions)
-  // Col0 bubble centres: A=96  B=122  C=148  D=174  (step=26px)
-  // Col1 bubble centres: A=449 B=475  C=501  D=527  (step=26px)
+  // RECALIBRATED v2 — measured from actual AutoChecker 50Q printed sheet:
+  //
+  //  Header breakdown (at canonical 794×1123):
+  //    Name/Section/Date row  ≈ 40px
+  //    Subject/Test row       ≈ 30px
+  //    Directions box         ≈ 38px
+  //    AutoChecker info line  ≈ 22px
+  //    Col header (A B C D)   ≈ 22px
+  //    Total header           ≈ 152px  → GRID_TOP = (152+22)/1123 = 0.1549
+  //    But add 20px top margin → first row cy ≈ 194px
+  //    GRID_TOP = (194 - ROW_STEP*H/2) / H
+  //
+  //  Row spacing: 25 rows fill ~820px of grid → ROW_STEP = 820/25/1123 = 0.0292
+  //
+  //  Col0 left edge: ~44px from paper edge  → COL_LEFT[0] = 44/794 = 0.0554
+  //  Col0 Q_NUM width: ~48px               → Q_NUM_W = 48/794 = 0.0604
+  //  Bubble A centre: 44+48+9 = 101px      
+  //  Bubble step (centre-to-centre): ~28px → BUBBLE_STEP = 28/794 = 0.0353
+  //  Bubble radius (inner ink zone): ~9px  → BUBBLE_R = 0.0113
+  //
+  //  Col1 left edge: visible divider at ~50% + gap → COL_LEFT[1] = 0.5100
+  //
+  //  HOW TO VERIFY: POST to /api/omr-debug with your image — red circles must
+  //  land INSIDE the printed bubbles. Adjust values by ±0.002 steps if off.
   2: {
-    GRID_TOP:    0.1870,
-    ROW_STEP:    0.0267,
+    GRID_TOP:    0.1800,
+    ROW_STEP:    0.0292,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0567, 0.5006],
-    Q_NUM_W:     0.0642,
-    BUBBLE_STEP: 0.0327,
+    COL_LEFT:    [0.0554, 0.5100],
+    Q_NUM_W:     0.0604,
+    BUBBLE_STEP: 0.0353,
   },
 
   // 3-column (51–100 questions)
