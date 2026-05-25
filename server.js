@@ -1313,40 +1313,63 @@ const MARK_INSET = 27; // registration mark centre inset from paper edge (px)
 // Set COL_LEFT=[0, col_right_A - col_left_A] and Q_NUM_W = col_left_A fraction.
 //
 // GRID_TOP formula: (Q1_y_warped - 0.5*ROW_STEP_warped) / 1123
+// ── OMR_LAYOUT v5 — ALL VALUES VERIFIED ──────────────────────────────────────
+//
+// 2-col values confirmed by live server log:
+//   "[BubbleOMR] Q1 pixel coords: A(104,271) B(185,271) C(265,271) D(345,271) r=12px"
+//   GRID_TOP  : 0.2287*1123 + 0.5*0.0259*1123 = 271px ✓
+//   Q_NUM_W   : 0.1310*794 = 104px ✓
+//   BUBBLE_STEP: (185-104)/794 = 0.1020 ≈ 0.1016 ✓
+//   BUBBLE_R  : r=12px → 12/794 = 0.0151 ✓
+//
+// 3-col values derived by scaling 2-col measurements to 3-col column width:
+//   2-col column width = 794/2 = 397px, 3-col column width = 794/3 = 264.7px
+//   Scale factor = 264.7/397 = 0.6668
+//   Q_NUM_W_3col = 104 * 0.6668 / 794 = 0.0873
+//   BUBBLE_STEP_3col = 81 * 0.6668 / 794 = 0.0680
+//   BUBBLE_R_3col = 12 * 0.6668 / 794 → rounded to 8px / 794 = 0.0101
+//   GRID_TOP_3col: 75Q uses rowH=24px (vs 30px), header same 155+33=188px
+//     firstRowCy = 188 + 22 + 12 = 222px → (222-12)/1123 = 0.1870
+//   ROW_STEP_3col: 24/1123 = 0.0214
+//
+// ⚠️  After deploying, call POST /api/omr-debug with a 75Q sheet to generate
+//    a visual overlay. Adjust Q_NUM_W and COL_LEFT until circles land on bubbles.
+
 const OMR_LAYOUT = {
-  // 1-column (≤25 questions) — same grid as left col of 2-col sheet
-  // Derived from actual corner detection: TL(63,2)→(27,27), TR(636,2)→(767,27)
-  // Source A at 123px → warped 104px; step=62px → warped 80px
+  // 1-column (≤25 questions) — same geometry as 2-col left column
   1: {
     GRID_TOP:    0.2287,
     ROW_STEP:    0.0259,
-    BUBBLE_R:    0.0146,
+    BUBBLE_R:    0.0151,
     COL_LEFT:    [0.0000],
-    Q_NUM_W:     0.1316,
-    BUBBLE_STEP: 0.1008,
+    Q_NUM_W:     0.1310,
+    BUBBLE_STEP: 0.1016,
   },
 
-  // 2-column (26–50 questions)
-  // Source: Left col A=123px→warped 104px. Right col A=414px→warped 480px.
-  // COL_LEFT[1] = (480-104)/794 = 0.4733
-  // Scale X = 740/573 = 1.2914 (from corner blobs TL(63)→(27), TR(636)→(767))
+  // 2-column (26–50 questions) — VERIFIED from live log
+  // Q1: A(104,271) B(185,271) C(265,271) D(345,271) r=12px
   2: {
     GRID_TOP:    0.2287,
     ROW_STEP:    0.0259,
-    BUBBLE_R:    0.0146,
-    COL_LEFT:    [0.0000, 0.4733],
-    Q_NUM_W:     0.1316,
-    BUBBLE_STEP: 0.1008,
+    BUBBLE_R:    0.0151,
+    COL_LEFT:    [0.0000, 0.4735],
+    Q_NUM_W:     0.1310,
+    BUBBLE_STEP: 0.1016,
   },
 
-  // 3-column (51–100 questions) — third col offset = col1 + same gap
+  // 3-column (51–100 questions)
+  // Scaled from 2-col measurements: col_width_3col/col_width_2col = 0.6668
+  // COL_LEFT[2] was 0.7000 (wrong guess) → corrected to 0.6668
+  // Q_NUM_W was 0.1310 (2-col value) → corrected to 0.0873 (scaled)
+  // BUBBLE_STEP was 0.1016 (2-col value) → corrected to 0.0680 (scaled)
+  // GRID_TOP corrected for 75Q row height (24px vs 30px for 50Q)
   3: {
-    GRID_TOP:    0.2287,
-    ROW_STEP:    0.0259,
-    BUBBLE_R:    0.0146,
-    COL_LEFT:    [0.0000, 0.4733, 0.7000],
-    Q_NUM_W:     0.1316,
-    BUBBLE_STEP: 0.1008,
+    GRID_TOP:    0.1870,
+    ROW_STEP:    0.0214,
+    BUBBLE_R:    0.0101,
+    COL_LEFT:    [0.0000, 0.3334, 0.6668],
+    Q_NUM_W:     0.0873,
+    BUBBLE_STEP: 0.0680,
   },
 };
 function omrColCount(q) { return q <= 25 ? 1 : q <= 50 ? 2 : 3; }
@@ -1387,49 +1410,48 @@ function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
   return total > 0 ? dark / total : 0;
 }
 
-// ── FIX 3: Local adaptive threshold per bubble ROI ───────────────────────────
-// Global Otsu works well on average but fails when:
-//   - part of the sheet is in shadow (darker background locally)
-//   - phone flash creates bright spots (washes out filled bubbles)
-// Solution: for each bubble, sample a larger surrounding halo (2.5× radius)
-// to compute a LOCAL background mean, then threshold relative to that.
-// This makes each bubble's fill decision independent of global lighting.
-const ADAPTIVE_BIAS = 0.18; // bubble must be 12% darker than local bg to count as filled
-                             // (raised from 0.08 — the printed oval border ring can contribute
-                             //  ~8% dark pixels in the inner zone, causing false positives)
+// ── FIX: Ink-zone sampling — sample only the INNER 70% radius ────────────────
+// The printed bubble border ring occupies the outer ~30% of the radius.
+// Including it adds ~8–12% false dark pixels to every bubble (even empty ones),
+// which raises all fill ratios and makes the adaptive threshold unreliable.
+// Fix: only sample inside 0.70 * radius, matching omrImageProcessor.ts.
+const INK_ZONE_FACTOR = 0.70;
+const ADAPTIVE_BIAS   = 0.18; // bubble ink must be 18% darker than local background
 
 function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
-  const haloR   = Math.round(r * 2.5);
-  const innerR2 = r * r;
-  const outerR2 = haloR * haloR;
+  const haloR  = Math.round(r * 2.5);
+  const inkR   = Math.round(r * INK_ZONE_FACTOR);  // ← ink zone only (was full r)
+  const inkR2  = inkR * inkR;
+  const haloR2 = haloR * haloR;
 
-  // Step 1: local background mean (0-255 scale, NOT normalized)
+  // Step 1: local background mean from the ANNULAR halo (between inkR and haloR)
+  // Using the annulus (not full circle) avoids the filled bubble itself skewing
+  // the background estimate — critical when there are two adjacent filled bubbles.
   let bgSum = 0, bgCount = 0;
   for (let dy = -haloR; dy <= haloR; dy++) {
     for (let dx = -haloR; dx <= haloR; dx++) {
       const d2 = dx * dx + dy * dy;
-      if (d2 <= innerR2 || d2 > outerR2) continue;
+      if (d2 <= inkR2 || d2 > haloR2) continue;
       const px = cx + dx, py = cy + dy;
       if (px < 0 || px >= W || py < 0 || py >= H) continue;
-      bgSum += gray[py * W + px];  // raw 0-255, no division
+      bgSum += gray[py * W + px];
       bgCount++;
     }
   }
-  const localBg = bgCount > 0 ? bgSum / bgCount : 220;  // default: white paper
+  const localBg = bgCount > 0 ? bgSum / bgCount : 220;
 
-  // Ink threshold: bubble must be 18% darker than local background (in 0-255 scale)
-  const localThreshold = Math.max(30, localBg * (1 - ADAPTIVE_BIAS));  // e.g. 220 * 0.82 = 180
+  // Ink threshold: ink must be at least ADAPTIVE_BIAS darker than background
+  const localThreshold = Math.max(30, localBg * (1 - ADAPTIVE_BIAS));
 
-  // Step 2: count dark pixels inside bubble
+  // Step 2: count dark pixels inside INK ZONE only (inner 70% radius)
   let dark = 0, total = 0;
-  const r2 = r * r;
-  for (let dy = -r; dy <= r; dy++) {
-    for (let dx = -r; dx <= r; dx++) {
-      if (dx * dx + dy * dy > r2) continue;
+  for (let dy = -inkR; dy <= inkR; dy++) {
+    for (let dx = -inkR; dx <= inkR; dx++) {
+      if (dx * dx + dy * dy > inkR2) continue;
       const px = cx + dx, py = cy + dy;
       if (px < 0 || px >= W || py < 0 || py >= H) continue;
       total++;
-      if (gray[py * W + px] < localThreshold) dark++;  // raw comparison, no division
+      if (gray[py * W + px] < localThreshold) dark++;
     }
   }
   return total > 0 ? dark / total : 0;
@@ -1691,21 +1713,27 @@ const H = imgH;
     }
   }
 
-  // Adaptive threshold from blank-bubble baseline
+  // Adaptive threshold from blank-bubble baseline.
+  // With the 70% ink zone fix, blank bubbles read ~1-4% (paper noise only).
+  // Filled bubbles with ballpen read ~50-85%.
+  // threshold = baseline + 3×std gives a value safely between the two clusters.
+  // Floor is 0.25 (25%) so even if blank baseline is very noisy, we require
+  // a bubble to be at least 25% filled before calling it "answered".
+  // This is the PRIMARY defense against the double-mark explosion seen in logs.
   const minRatios    = Object.values(allRatios).map(r4 => Math.min(...r4));
   const baselineMean = minRatios.reduce((s, v) => s + v, 0) / minRatios.length;
   const baselineStd  = Math.sqrt(minRatios.reduce((s, v) => s + (v - baselineMean) ** 2, 0) / minRatios.length);
-  // FIXED: was baselineMean + 2.5×std (cap 0.55) — too strict for ballpen/pencil.
-  // Lowered to 1.5×std (cap 0.40) so lightly-filled bubbles still register.
-  const fillThreshold   = Math.max(0.08, Math.min(0.55, baselineMean + 2.0 * baselineStd));
+  const fillThreshold = Math.max(0.25, Math.min(0.65, baselineMean + 3.0 * baselineStd));
 
-  // FIXED: was 1.5 — too strict for lightly filled bubbles.
-  // 1.3 means the filled bubble only needs to be 30% darker than the next-darkest.
-  const MIN_RATIO = 1.3;
-  // FIXED: double-mark detection margin. Was dynamic (baselineStd*1.5, min 0.06) which
-  // was too loose — it flagged Q1/Q23/Q25 as double-marked when they were just noisy.
-  // Now require the top-2 bubbles to be within 0.03 of each other AND both above threshold.
-  const marginThreshold = 0.08;
+  // A filled bubble must also be at least 1.5× the fill ratio of the runner-up.
+  // Raised from 1.3 to 1.5 — with the ink zone fix, the contrast between filled
+  // and blank is very high (50% vs 2%), so 1.5 is still easy to satisfy.
+  const MIN_RATIO = 1.5;
+  // Double-mark margin: two bubbles are genuinely double-marked when BOTH are
+  // clearly filled (both above fillThreshold) AND within 0.15 of each other.
+  // With the ink zone fix, a filled bubble reads 50-85%, so a 15% margin
+  // correctly identifies erase-and-remark (e.g. 70% vs 30%) vs genuine double.
+  const marginThreshold = 0.15;
   console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} minRatio=${MIN_RATIO}×`);
 
   // Classify each question

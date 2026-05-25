@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "d9da3f60-4e43-4384-8914-bb047b01355b"
+      }
+    },
+    "android": {
+      "package": "com.hevnami112.autocheckerbackend"
+    }
+  }
+}
