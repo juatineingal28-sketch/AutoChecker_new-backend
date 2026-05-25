@@ -1336,25 +1336,36 @@ const MARK_INSET = 27; // registration mark centre inset from paper edge (px)
 //    a visual overlay. Adjust Q_NUM_W and COL_LEFT until circles land on bubbles.
 
 const OMR_LAYOUT = {
-  // 1-column (≤25 questions) — same geometry as 2-col left column
+  // ── ALL VALUES EXACT from omrConfig.ts v5.4 ──────────────────────────────
+  // PAGE_W=794 PAGE_H=1123 PAPER_PAD=12 OUTER_PAD=33 HEADER_H=132
+  // gridTop = 12+132+33 = 177px   COL_HEADER_H=24px
+  // firstRowCy = 177+24+15 = 216px   GRID_TOP = 201/1123 = 0.1790
+  // BUBBLE_W=18 BUBBLE_H=18 BUBBLE_GAP=8 → BUBBLE_STEP=26px=0.0327
+  // BUBBLE_R = 9px = 0.0113   ROW_H=30 → ROW_STEP=0.0267
+
+  // 1-column (≤25 questions)
+  // colInnerW=704px  qNumW=36  qNumOffset=6+36+2+9=53px=0.0668
+  // bubbleA_x = 45+53 = 98px
   1: {
-    GRID_TOP:    0.2287,
-    ROW_STEP:    0.0259,
-    BUBBLE_R:    0.0151,
-    COL_LEFT:    [0.0000],
-    Q_NUM_W:     0.1310,
-    BUBBLE_STEP: 0.1016,
+    GRID_TOP:    0.1790,
+    ROW_STEP:    0.0267,
+    BUBBLE_R:    0.0113,
+    COL_LEFT:    [0.0567],
+    Q_NUM_W:     0.0668,
+    BUBBLE_STEP: 0.0327,
   },
 
-  // 2-column (26–50 questions) — VERIFIED from live log
-  // Q1: A(104,271) B(185,271) C(265,271) D(345,271) r=12px
+  // 2-column (26–50 questions)
+  // colInnerW=351.5px  qNumW=34  qNumOffset=6+34+2+9=51px=0.0642
+  // COL_LEFT[0]=45px=0.0567  COL_LEFT[1]=397.5px=0.5006
+  // bubbleA centres: Col0=96px  Col1=449px
   2: {
-    GRID_TOP:    0.2287,
-    ROW_STEP:    0.0259,
-    BUBBLE_R:    0.0151,
-    COL_LEFT:    [0.0000, 0.4735],
-    Q_NUM_W:     0.1310,
-    BUBBLE_STEP: 0.1016,
+    GRID_TOP:    0.1790,
+    ROW_STEP:    0.0267,
+    BUBBLE_R:    0.0113,
+    COL_LEFT:    [0.0567, 0.5006],
+    Q_NUM_W:     0.0642,
+    BUBBLE_STEP: 0.0327,
   },
 
   // 3-column (51–100 questions)
@@ -1747,28 +1758,42 @@ const H = imgH;
     }
   }
 
-  // Adaptive threshold from blank-bubble baseline.
-  // With the 70% ink zone fix, blank bubbles read ~1-4% (paper noise only).
-  // Filled bubbles with ballpen read ~50-85%.
-  // threshold = baseline + 3×std gives a value safely between the two clusters.
-  // Floor is 0.25 (25%) so even if blank baseline is very noisy, we require
-  // a bubble to be at least 25% filled before calling it "answered".
-  // This is the PRIMARY defense against the double-mark explosion seen in logs.
-  const minRatios    = Object.values(allRatios).map(r4 => Math.min(...r4));
-  const baselineMean = minRatios.reduce((s, v) => s + v, 0) / minRatios.length;
-  const baselineStd  = Math.sqrt(minRatios.reduce((s, v) => s + (v - baselineMean) ** 2, 0) / minRatios.length);
-  const fillThreshold = Math.max(0.25, Math.min(0.65, baselineMean + 3.0 * baselineStd));
+  // ── Adaptive fill threshold — works for both light ballpen and heavy pencil ──
+  //
+  // Strategy: use ALL bubble ratios (not just minimums) to find two clusters:
+  //   • blank cluster  → low ratios (noise from paper/border)
+  //   • filled cluster → higher ratios (ink)
+  //
+  // For ballpen on this sheet, filled bubbles read 10–85% depending on pen
+  // pressure and alignment. Blank bubbles read 0–15%.
+  //
+  // Step 1: collect every ratio value across all questions/options
+  const allRatioValues = Object.values(allRatios).flatMap(r4 => r4);
+  const maxRatioSeen   = Math.max(...allRatioValues);
 
-  // A filled bubble must also be at least 1.5× the fill ratio of the runner-up.
-  // Raised from 1.3 to 1.5 — with the ink zone fix, the contrast between filled
-  // and blank is very high (50% vs 2%), so 1.5 is still easy to satisfy.
-  const MIN_RATIO = 1.5;
-  // Double-mark margin: two bubbles are genuinely double-marked when BOTH are
-  // clearly filled (both above fillThreshold) AND within 0.15 of each other.
-  // With the ink zone fix, a filled bubble reads 50-85%, so a 15% margin
-  // correctly identifies erase-and-remark (e.g. 70% vs 30%) vs genuine double.
-  const marginThreshold = 0.15;
-  console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} minRatio=${MIN_RATIO}×`);
+  // Step 2: per-row relative detection — for each question, the darkest bubble
+  // wins IF it is clearly dominant over the others (ratio test).
+  // This handles light ballpen (10-20% fill) that fails absolute thresholds.
+  //
+  // Absolute floor: must be at least 8% filled (eliminates pure noise).
+  // Lowered from 25% → 8% because logs show answered bubbles at 10-20%.
+  //
+  // Ratio test: winner must be ≥1.4× the second-place bubble.
+  // Lowered from 1.5 → 1.4 to handle cases like [19.8%, 5.6%] = ratio 3.5 ✓
+  //
+  // Double-mark: both top-2 above floor AND within 30% of each other.
+  // Widened from 15% → 30% because light ink gives lower absolute margins.
+
+  // Compute a per-scan adaptive floor:
+  //   sort all values, take the 90th percentile as "max fill seen"
+  //   floor = max(0.08, maxFill * 0.15)  — at least 15% of the darkest bubble
+  const sorted90 = [...allRatioValues].sort((a, b) => a - b);
+  const p90      = sorted90[Math.floor(sorted90.length * 0.90)] ?? 0;
+  const FILL_FLOOR = Math.max(0.08, Math.min(0.20, p90 * 0.20));
+  const MIN_RATIO  = 1.4;
+  const DOUBLE_MARGIN = 0.30; // two bubbles within 30% of each other = double mark
+
+  console.log(`[BubbleOMR] maxRatio=${(maxRatioSeen*100).toFixed(1)}% p90=${(p90*100).toFixed(1)}% → fillFloor=${(FILL_FLOOR*100).toFixed(1)}% minRatio=${MIN_RATIO}×`);
 
   // Classify each question
   const answers = {};
@@ -1779,17 +1804,16 @@ const H = imgH;
     const best    = sorted[0];
     const second  = sorted[1] ?? 0;
     const bestIdx = ratios.indexOf(best);
-    const aboveCount = ratios.filter(rv => rv >= fillThreshold).length;
 
-    // ── FIX 2 applied: use ratio test in addition to absolute threshold ──────
-    const ratio = second > 0.001 ? best / second : best / 0.001;
+    const ratio  = second > 0.005 ? best / second : best / 0.005;
     const margin = best - second;
 
-    if (aboveCount >= 2 && margin < marginThreshold) {
+    // Double mark: both top candidates are clearly filled AND nearly equal
+    if (best >= FILL_FLOOR && second >= FILL_FLOOR && margin < DOUBLE_MARGIN * best) {
       answers[String(qStr)] = '';
       doubleMarked++;
       console.log(`[BubbleOMR] Q${qStr}: DOUBLE MARK [${ratios.map(rv => (rv*100).toFixed(1)+'%').join(', ')}]`);
-    } else if (best >= fillThreshold && ratio >= MIN_RATIO) {
+    } else if (best >= FILL_FLOOR && ratio >= MIN_RATIO) {
       answers[String(qStr)] = OPTIONS[bestIdx];
       console.log(`[BubbleOMR] Q${qStr}: ${OPTIONS[bestIdx]} ratio=${ratio.toFixed(2)} [${ratios.map(rv => (rv*100).toFixed(1)+'%').join(', ')}]`);
     } else {
@@ -3097,4 +3121,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260525-omr-3col-exact-from-omrconfig-v8
+// redeploy-trigger-20260525-omr-all-layouts-exact-threshold-fix-v10
