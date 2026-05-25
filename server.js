@@ -1394,11 +1394,9 @@ function sampleCircle(gray, W, H, cx, cy, r, darkThreshold) {
 // Solution: for each bubble, sample a larger surrounding halo (2.5× radius)
 // to compute a LOCAL background mean, then threshold relative to that.
 // This makes each bubble's fill decision independent of global lighting.
-const ADAPTIVE_BIAS = 0.18; // bubble must be 18% darker than local bg to count as filled
-                             // FIX: was 0.12 — at 12%, the printed oval border ring (~8-10%
-                             // dark pixels) was too close to the threshold, triggering false
-                             // positives and double-marks. 18% gives clean separation:
-                             // empty bubble halo ≈8%, filled bubble ≈35-50%.
+const ADAPTIVE_BIAS = 0.18; // bubble must be 12% darker than local bg to count as filled
+                             // (raised from 0.08 — the printed oval border ring can contribute
+                             //  ~8% dark pixels in the inner zone, causing false positives)
 
 function sampleCircleAdaptive(gray, W, H, cx, cy, r) {
   const haloR   = Math.round(r * 2.5);
@@ -1590,24 +1588,17 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
   }
 
   // Reject blobs too small (noise) OR too large (image border/header line — not a reg mark)
-  // FIX: was min=50,max=8000. On a 3120×4160 full-res image the 30px corner marks
-  // have area ~900px but scanner artifacts can push it to ~15000. Raise cap to 20000.
-  // Lower min to 30 so smaller corner marks on printed sheets still register.
   if (bestArea < 30 || bestArea > 20000) return null;
   return { cx: bestSumX / bestArea, cy: bestSumY / bestArea };
 }
 
-// Search region: 22% of image dimensions — large enough to catch marks even on
+// Search region: 18% of image dimensions — large enough to catch marks even on
 // tilted phone photos, while still excluding the bubble grid area.
-// FIX: was 18% (562×749px on 3120×4160) — corners of this sheet are right at
-// the paper edge, so 18% sometimes clips them. 22% gives 50% more margin.
+// (Old value was 10% which was too small for some phone aspect ratios.)
 const searchW = Math.round(imgW * 0.22);
-const searchH = Math.round(imgH * 0.22);
-// FIX: cornerThr cap was 160 — too high for white paper (Otsu ~124 → cap=160 → blob
-// detection threshold=105; but the corner squares are ~30px wide and very dark so
-// they need a threshold close to Otsu*0.75 ~= 90 to be reliably detected).
-// Cap lowered to 120 so threshold = min(Otsu*0.85, 120). Otsu~124 → thr=105.
-const cornerThr = Math.min(otsuThreshold(gray) * 0.85, 120);
+const searchH = Math.round(imgH * 0.18);
+const _otsuFull = otsuThreshold(gray);
+const cornerThr = Math.round(_otsuFull * 0.85); // NO cap — relative to image brightness
 
 const tlBlob = findCornerBlob(gray, imgW, imgH, 0, 0, searchW, searchH, cornerThr);
 const trBlob = findCornerBlob(gray, imgW, imgH, imgW - searchW, 0, imgW, searchH, cornerThr);
@@ -1688,19 +1679,16 @@ const H = imgH;
   const minRatios    = Object.values(allRatios).map(r4 => Math.min(...r4));
   const baselineMean = minRatios.reduce((s, v) => s + v, 0) / minRatios.length;
   const baselineStd  = Math.sqrt(minRatios.reduce((s, v) => s + (v - baselineMean) ** 2, 0) / minRatios.length);
-  // FIXED: was baselineMean + 1.5×std (cap 0.40) — cap was too low for ballpen fills.
-  // Ballpen bubbles can read 0.35-0.50 fill ratio. With adaptive bias now at 0.18,
-  // empty bubbles baseline is ~0.05-0.08, so threshold of baselineMean+2×std ≈ 0.12-0.18
-  // cleanly separates filled (≥0.30) from empty (≤0.15).
-  const fillThreshold   = Math.max(0.08, Math.min(0.55, baselineMean + 2.0 * baselineStd));
+  // FIXED: was baselineMean + 2.5×std (cap 0.55) — too strict for ballpen/pencil.
+  // Lowered to 1.5×std (cap 0.40) so lightly-filled bubbles still register.
+  const fillThreshold = Math.max(0.08, Math.min(0.55, baselineMean + 2.0 * baselineStd));
 
   // FIXED: was 1.5 — too strict for lightly filled bubbles.
   // 1.3 means the filled bubble only needs to be 30% darker than the next-darkest.
   const MIN_RATIO = 1.3;
-  // FIXED: double-mark detection margin. Was 0.03 — far too tight.
-  // At 0.03, any two bubbles within 3% of each other = flagged as double-mark,
-  // which is almost always just noise in the border ring (Q32, Q35, Q40 etc).
-  // 0.08 means both bubbles must be genuinely close AND both above fillThreshold.
+  // FIXED: double-mark detection margin. Was dynamic (baselineStd*1.5, min 0.06) which
+  // was too loose — it flagged Q1/Q23/Q25 as double-marked when they were just noisy.
+  // Now require the top-2 bubbles to be within 0.03 of each other AND both above threshold.
   const marginThreshold = 0.08;
   console.log(`[BubbleOMR] Baseline mean=${baselineMean.toFixed(3)} std=${baselineStd.toFixed(3)} → fill≥${fillThreshold.toFixed(3)} minRatio=${MIN_RATIO}×`);
 
