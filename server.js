@@ -1224,29 +1224,29 @@ const MARK_INSET = 27; // registration mark center inset from paper edge (px)
 // ── OMR Detection constants — all named, none magic ───────────────────────────
 const OMR_CONSTANTS = {
   // Bubble sampling
-  INK_ZONE_FACTOR:   0.55,   // sample inner 55% of radius — tighter zone reduces neighbor bleed
-  CENTER_WEIGHT_EXP: 2.5,    // stronger center weighting: center ink counts more than edge
-  ADAPTIVE_BIAS:     0.12,   // ink must be 12% darker than local bg (was 10%, catches shadow)
+  INK_ZONE_FACTOR:   0.50,   // sample inner 50% of radius — tighter zone reduces neighbor bleed (was 0.55)
+  CENTER_WEIGHT_EXP: 3.0,    // stronger center weighting: center ink counts much more than edge (was 2.5)
+  ADAPTIVE_BIAS:     0.14,   // ink must be 14% darker than local bg (was 12%, better shadow rejection)
 
   // Fill classification
   MIN_FILLED_PERCENT: 0.15,  // minimum fill — ballpen on phone photo reads as low as 25%
   BLANK_SIGMA_MULT:   1.5,   // fill floor = blank_mean + 1.5×blank_std — less aggressive
 
-  // Double-mark detection — KEY FIX:
+  // Double-mark detection — KEY FIX v8:
   // Real double-marks are very rare on ballpen sheets.
-  // The old ratio=0.82 + fill=0.28 caused massive false-double on phone photos
-  // where shadow/compression made the runner-up look 82% as dark as the winner.
-  // Fix: raise BOTH thresholds significantly so only genuinely ambiguous marks
-  // are called double. If one bubble is clearly dominant (ratio < 0.88), pick it.
-  DOUBLE_MARK_RATIO: 0.88,   // second/top must be ≥88% — nearly identical fills = double
-  MIN_DOUBLE_FILL:   0.40,   // BOTH bubbles must exceed 40% — requires real heavy ink
+  // DOUBLE_MARK_RATIO raised to 0.93: both bubbles must be ≥93% as dark as each other
+  // to be considered "genuinely ambiguous". This prevents phone-photo shadow from
+  // triggering false doubles when one bubble is clearly darker than the other.
+  // MIN_DOUBLE_FILL raised to 0.50: requires very heavy ink on BOTH bubbles.
+  DOUBLE_MARK_RATIO: 0.93,   // second/top must be ≥93% — only truly identical fills = double
+  MIN_DOUBLE_FILL:   0.50,   // BOTH bubbles must exceed 50% — very high bar for real double
 
   // Winner disambiguation
-  MIN_RATIO:         1.25,   // winner needs only 25% stronger than runner-up (was 35%)
-  MARGIN_THRESH_MULT: 3.0,   // margin must exceed blank_std × 3.0 (was 3.5)
+  MIN_RATIO:         1.20,   // winner needs only 20% stronger than runner-up (was 25%)
+  MARGIN_THRESH_MULT: 2.5,   // margin must exceed blank_std × 2.5 (was 3.0, easier to pick winner)
 
-  // Second-pass retry
-  SECOND_PASS_CONF_THRESHOLD: 0.50,  // retry low-confidence questions
+  // Second-pass retry — lowered threshold so MORE questions get the benefit of retry
+  SECOND_PASS_CONF_THRESHOLD: 0.65,  // retry questions below 65% confidence (was 50%)
   SECOND_PASS_Y_OFFSETS: [-3, -2, -1, 1, 2, 3],  // ±3px local refinement
 
   // Dynamic row recalibration (FIX 2)
@@ -1753,10 +1753,11 @@ function classifyQuestion(fills, fillFloor, blankStd, qNum) {
 
   if (isDoubleCandidate) {
     // RESOLVE: pick the darker one — it's almost certainly the real answer.
-    // Only flag isDouble=true if the margin is truly tiny (< 3% absolute).
-    // This eliminates the "18 doubles returned as blank" problem.
+    // Only flag isDouble=true if the margin is truly microscopic (< 1.5% absolute).
+    // The old 3% threshold caused real answers (margin 1-3%) to be blanked.
+    // At 1.5%, only fills that are essentially identical (e.g. 86.2 vs 86.0) are flagged.
     const absoluteMargin = best.f - second.f;
-    if (absoluteMargin < 0.03) {
+    if (absoluteMargin < 0.015) {
       // Genuinely ambiguous — flag as double (blank) so student can review
       console.log(`[BubbleOMR] Q${qNum}: TRUE DOUBLE (top=${(best.f*100).toFixed(1)}% 2nd=${(second.f*100).toFixed(1)}% margin=${(absoluteMargin*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
       return { answer: '', confidence: 0, isDouble: true, isBlank: false };
@@ -1764,7 +1765,7 @@ function classifyQuestion(fills, fillFloor, blankStd, qNum) {
     // One is clearly darker — resolve to it (most common case with ballpen)
     const letter = OPTIONS[best.i];
     console.log(`[BubbleOMR] Q${qNum}: ${letter} (resolved double: top=${(best.f*100).toFixed(1)}% 2nd=${(second.f*100).toFixed(1)}% margin=${(absoluteMargin*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
-    return { answer: letter, confidence: rawConfidence * 0.75, isDouble: false, isBlank: false };
+    return { answer: letter, confidence: rawConfidence * 0.80, isDouble: false, isBlank: false };
   }
 
   // Case 3: Normal — pick the top bubble
@@ -3316,7 +3317,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '7.2-rowstep-recalibrated',
+  version: '8.0-accuracy-trueDouble-inkzone',
 }));
 
 // Error handler
@@ -3338,4 +3339,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v72-rowstep-0310-snap12
+// redeploy-trigger-20260526-v80-accuracy-fix-trueDouble-inkzone
