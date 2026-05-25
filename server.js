@@ -1224,7 +1224,10 @@ const MARK_INSET = 27; // registration mark center inset from paper edge (px)
 // ── OMR Detection constants — all named, none magic ───────────────────────────
 const OMR_CONSTANTS = {
   // Bubble sampling
-  INK_ZONE_FACTOR:   0.55,
+  // FIX: Reduced INK_ZONE_FACTOR 0.55→0.45 — samples only the true inner fill zone,
+  // avoids picking up ink bleed from the printed border ring which was causing
+  // spurious high fills on adjacent/empty bubbles.
+  INK_ZONE_FACTOR:   0.45,
   CENTER_WEIGHT_EXP: 2.5,
   ADAPTIVE_BIAS:     0.12,
 
@@ -1232,25 +1235,24 @@ const OMR_CONSTANTS = {
   MIN_FILLED_PERCENT: 0.12,
   BLANK_SIGMA_MULT:   1.2,
 
-  // Double-mark — v9.2: always resolve to highest fill, never blank
-  DOUBLE_MARK_RATIO: 0.95,   // trigger double-check when second ≥95% of best
-  MIN_DOUBLE_FILL:   0.50,   // both must be ≥50% to be a double candidate
+  // Double-mark — FIX: Raised 0.95→0.98. The old 0.95 triggered on Q9(52%/50.1%),
+  // Q19(76.8%/76.6%), Q30(88.5%/84.6%) which were border bleeds, not real double marks.
+  // At 0.98 only truly indistinguishable fills (within 2%) trigger double resolution.
+  DOUBLE_MARK_RATIO: 0.98,
+  MIN_DOUBLE_FILL:   0.55,   // raised from 0.50 — both must be strongly filled
 
   // Winner disambiguation
   MIN_RATIO:         1.12,
   MARGIN_THRESH_MULT: 2.0,
 
-  // Second-pass retry — v9.2: only truly ambiguous questions retry
-  SECOND_PASS_CONF_THRESHOLD: 0.18,
-  SECOND_PASS_Y_OFFSETS: [-2, -1, 1, 2],
+  // Second-pass — FIX: Raised threshold 0.18→0.25 so only genuinely ambiguous
+  // questions retry. Lowered Y offsets to ±1px only — ±2px was jumping to wrong rows.
+  SECOND_PASS_CONF_THRESHOLD: 0.25,
+  SECOND_PASS_Y_OFFSETS: [-1, 1],
 
-  // Row snapping — v9.2 KEY FIX:
-  // Increased back to 10px from 4px. The perspective warp leaves 5-12px residual
-  // Y error per row. The new snapRowY v9.2 is smarter — it scans a 2D rectangle
-  // instead of a 1D line, and requires a 15% improvement over no-snap before
-  // committing. This prevents over-snapping while allowing real drift correction.
-  ROW_SNAP_SEARCH_RADIUS: 10,
-  ROW_SNAP_MIN_DARK_FRAC: 0.18,  // requires 18% dark pixel density to snap
+  // Row snapping
+  ROW_SNAP_SEARCH_RADIUS: 8,   // reduced from 10 — tighter snap, less risk of wrong row
+  ROW_SNAP_MIN_DARK_FRAC: 0.20, // raised from 0.18 — requires stronger ink signal to snap
 
   // Preprocessing
   GAUSSIAN_SIGMA: 0.8,
@@ -1278,19 +1280,14 @@ const OMR_LAYOUT = {
     BUBBLE_STEP: 0.1020,
   },
   // ── 2-column layout (26–50 questions) ─────────────────────────────────────
-  // RECALIBRATED v6.2 from live log + confirmed measurements:
-  //   Log shows: Q1 A=92px, cy=219px — GRID_TOP/ROW_STEP confirmed correct.
-  //   Real bubble step = 81px (confirmed from old log: A=104→B=185, step=81)
-  //   Previous BUBBLE_STEP=0.0353 was 28px — 3x too small! All 4 sample points
-  //   landed inside a single real bubble → every question read as contaminated.
-  //
-  //   Q_NUM_W   = 92/794  = 0.1159  (COL_LEFT[0]=0, so A_x = Q_NUM_W * W)
-  //   BUBBLE_STEP = 81/794 = 0.1020
-  //   Col0: A=92  B=173  C=254  D=335 px
-  //   Col1: A=448 B=529  C=610  D=691 px  (448 from old confirmed log)
-  //   COL_LEFT[1] = (448-92)/794 = 0.4484
+  // RECALIBRATED v9.1 from live production log:
+  //   Log: Q1 A(92,217) r=9px at H=1123 → GRID_TOP = 217/1123 = 0.1932
+  //   Previous GRID_TOP=0.1780 = 200px — was 17px too high, causing cumulative
+  //   row drift that required excessive second-pass retries by Q13+.
+  //   ROW_STEP confirmed: (snappedCy row-to-row diff from log ≈ 34.8px) / 1123 = 0.0310 ✓
+  //   Q_NUM_W and BUBBLE_STEP unchanged — confirmed correct from fills log.
   2: {
-    GRID_TOP:    0.1780,
+    GRID_TOP:    0.1932,
     ROW_STEP:    0.0310,
     BUBBLE_R:    0.0113,
     COL_LEFT:    [0.0000, 0.4484],
@@ -2002,6 +1999,8 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
           bestAnswer = result.answer;
           console.log(`[BubbleOMR] Q${qNum} second-pass Y+${yOff}px improved → ${bestAnswer || '?'} (conf ${(bestConf*100).toFixed(1)}%)`);
         }
+        // Stop early if already confident enough — no need to try more offsets
+        if (bestConf >= 0.40) break;
       }
 
       answers[qStr]     = bestAnswer;
@@ -2351,70 +2350,72 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   const isMcType  = isBubble || examType === 'text_mc' || examType === 'multiple_choice' || examType === 'mc';
   const isWritten = !isMcType;
 
-  // ── Route bubble_omr: Jimp pixel detector PRIMARY, Groq AI as fallback ───────
-  // ARCHITECTURE CHANGE v9.0:
-  // Jimp is now PRIMARY. It uses perspective correction (4-corner homography),
-  // shadow normalization, CLAHE, and adaptive thresholding — deterministic and
-  // accurate when the sheet is photographed reasonably flat.
+  // ── Route bubble_omr: Groq AI vision FIRST, Jimp pixel detector as fallback ──
+  // ARCHITECTURE CHANGE v8.2:
+  // Groq vision (AI) is now the PRIMARY engine for bubble sheets.
+  // Reason: Jimp pixel detection requires perfect overhead alignment + calibrated
+  // grid constants. Phone photos taken at even slight angles cause grid drift that
+  // makes Jimp sample the wrong bubbles — producing wrong answers even though it
+  // "finds" 40-50 bubbles (so the fallback never triggers).
   //
-  // Groq is FALLBACK only — used when Jimp finds fewer than 70% of bubbles,
-  // which happens when corners aren't detected (extreme angle/lighting).
+  // Groq vision SEES the actual filled bubble visually — it works regardless of:
+  //   - Camera angle / perspective
+  //   - Slight grid misalignment
+  //   - Varying lighting / shadows
+  //   - Different sheet prints (slight scaling differences)
   //
-  // Why Groq was demoted: it consistently hallucinates on dense 50-row sheets,
-  // returning the same letter for large blocks of questions regardless of prompting.
+  // Jimp pixel detector is kept as fallback for when Groq is unavailable.
 if (isBubble) {
 
-  // Pre-process for Jimp: sharp JPEG at full resolution, contrast enhanced.
-  // Keep JPEG (not PNG) — Jimp reads JPEG fine and it stays small.
+  // Pre-process: maximise contrast without destroying grayscale gradients.
   let processedBase64 = imageBase64;
   let processedMime   = mimeType || 'image/jpeg';
   if (sharp) {
     try {
       const inputBuf = Buffer.from(imageBase64, 'base64');
       const processed = await sharp(inputBuf)
-        .rotate()                                      // fix EXIF orientation
-        .resize(1800, 1800, { fit: 'inside', withoutEnlargement: true })
-        .modulate({ brightness: 1.05 })
+        .rotate()
+        .greyscale()
+        .modulate({ brightness: 1.10, contrast: 1.15 })
         .normalise()
-        .sharpen({ sigma: 0.6, m1: 0.4, m2: 0.1 })
-        .jpeg({ quality: 93 })
+        .median(3)
+        .sharpen({ sigma: 1.2, m1: 1.0, m2: 0.5 })
+        .png()
         .toBuffer();
       processedBase64 = processed.toString('base64');
-      processedMime   = 'image/jpeg';
-      const kb = Math.round(processed.length / 1024);
-      console.log(`[AutoChecker] v9.0 — Bubble pre-processed for Jimp: ${kb}KB JPEG ✓`);
+      processedMime   = 'image/png';
+      console.log('[AutoChecker] Bubble image normalised ✓');
     } catch (e) {
       console.warn('[AutoChecker] sharp pre-processing failed:', e.message);
     }
   }
 
-  // PRIMARY: Jimp pixel detector — deterministic, no hallucination
-  try {
-    console.log('[AutoChecker] v9.0 — Bubble OMR: Jimp pixel detector PRIMARY');
-    const jimpResult = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
-    const minGood    = Math.ceil(questionCount * 0.70); // need 70%+ to trust Jimp
-    if (jimpResult && jimpResult.answeredCount >= minGood) {
-      console.log(`[AutoChecker] Jimp PRIMARY ✓ — ${jimpResult.answeredCount}/${questionCount} bubbles detected`);
-      return jimpResult;
-    }
-    console.warn(`[AutoChecker] Jimp only found ${jimpResult?.answeredCount ?? 0}/${questionCount} — trying Groq fallback`);
-  } catch (err) {
-    console.warn('[AutoChecker] Jimp primary error:', err.message);
-  }
-
-  // FALLBACK: Groq AI vision — for when Jimp can't find corners (bad angle/light)
+  // PRIMARY: Groq AI vision — reads filled bubbles visually, angle-tolerant
   if (groqReady) {
     try {
-      console.log('[AutoChecker] Groq AI vision FALLBACK — Jimp did not reach 70% threshold');
+      console.log('[AutoChecker] v8.2 — Bubble OMR: trying Groq AI vision FIRST (primary)');
       const groqResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount);
       if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
-        console.log(`[AutoChecker] Groq fallback — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
+        console.log(`[AutoChecker] Groq AI vision PRIMARY — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
         return groqResult;
       }
-      console.warn(`[AutoChecker] Groq fallback only got ${groqResult?.answeredCount ?? 0}/${questionCount}`);
+      console.warn(`[AutoChecker] Groq returned only ${groqResult?.answeredCount ?? 0}/${questionCount} — trying Jimp fallback`);
     } catch (err) {
-      console.warn('[AutoChecker] Groq fallback failed:', err.message);
+      console.warn('[AutoChecker] Groq primary failed, falling back to Jimp:', err.message);
     }
+  }
+
+  // FALLBACK: Jimp pixel detector (when Groq unavailable or returns too few)
+  try {
+    const jimpResult = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
+    const minAcceptable = Math.ceil(questionCount * 0.20);
+    if (jimpResult && jimpResult.answeredCount >= minAcceptable) {
+      console.log(`[AutoChecker] Jimp pixel detection fallback — ${jimpResult.answeredCount}/${questionCount} bubbles ✓`);
+      return jimpResult;
+    }
+    console.warn(`[AutoChecker] Jimp found only ${jimpResult?.answeredCount ?? 0}/${questionCount}`);
+  } catch (err) {
+    console.warn('[AutoChecker] Jimp detection error:', err.message);
   }
 
   console.log('[AutoChecker] All bubble engines failed — returning empty result');
