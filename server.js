@@ -1224,34 +1224,39 @@ const MARK_INSET = 27; // registration mark center inset from paper edge (px)
 // ── OMR Detection constants — all named, none magic ───────────────────────────
 const OMR_CONSTANTS = {
   // Bubble sampling
-  INK_ZONE_FACTOR:   0.60,   // only sample inner 60% of bubble radius (was 70%) — tighter, less neighbor bleed
-  CENTER_WEIGHT_EXP: 2.0,    // distance weight exponent: weight = (1 - dist/r)^2 — center pixels count more
-  ADAPTIVE_BIAS:     0.10,   // ink must be 10% darker than local background
+  INK_ZONE_FACTOR:   0.55,   // sample inner 55% of radius — tighter zone reduces neighbor bleed
+  CENTER_WEIGHT_EXP: 2.5,    // stronger center weighting: center ink counts more than edge
+  ADAPTIVE_BIAS:     0.12,   // ink must be 12% darker than local bg (was 10%, catches shadow)
 
   // Fill classification
-  MIN_FILLED_PERCENT: 0.22,  // minimum fill to count as answered (FIX 4: was effectively 0.25+)
-  BLANK_SIGMA_MULT:   2.5,   // fill floor = blank_mean + 2.5×blank_std (was 3.0 — too aggressive)
+  MIN_FILLED_PERCENT: 0.20,  // minimum fill to count as answered
+  BLANK_SIGMA_MULT:   2.0,   // fill floor = blank_mean + 2.0×blank_std (more sensitive)
 
-  // Double-mark detection (FIX 3: strict dual-threshold)
-  DOUBLE_MARK_RATIO: 0.82,   // second / top ratio: must be ≥82% to call double
-  MIN_DOUBLE_FILL:   0.28,   // BOTH bubbles must exceed 28% to call double
+  // Double-mark detection — KEY FIX:
+  // Real double-marks are very rare on ballpen sheets.
+  // The old ratio=0.82 + fill=0.28 caused massive false-double on phone photos
+  // where shadow/compression made the runner-up look 82% as dark as the winner.
+  // Fix: raise BOTH thresholds significantly so only genuinely ambiguous marks
+  // are called double. If one bubble is clearly dominant (ratio < 0.88), pick it.
+  DOUBLE_MARK_RATIO: 0.88,   // second/top must be ≥88% — nearly identical fills = double
+  MIN_DOUBLE_FILL:   0.40,   // BOTH bubbles must exceed 40% — requires real heavy ink
 
   // Winner disambiguation
-  MIN_RATIO:         1.35,   // winner must be 35% stronger than runner-up
-  MARGIN_THRESH_MULT: 3.5,   // margin must exceed blank_std × 3.5
+  MIN_RATIO:         1.25,   // winner needs only 25% stronger than runner-up (was 35%)
+  MARGIN_THRESH_MULT: 3.0,   // margin must exceed blank_std × 3.0 (was 3.5)
 
   // Second-pass retry
-  SECOND_PASS_CONF_THRESHOLD: 0.45,  // questions below this confidence get retried
-  SECOND_PASS_Y_OFFSETS: [-3, -2, -1, 1, 2, 3],  // Y adjustments to try (px)
+  SECOND_PASS_CONF_THRESHOLD: 0.60,  // retry more questions (was 0.45)
+  SECOND_PASS_Y_OFFSETS: [-4, -3, -2, -1, 1, 2, 3, 4],  // wider Y search
 
   // Dynamic row recalibration (FIX 2)
-  ROW_SNAP_SEARCH_RADIUS: 5,  // search ±5px around expected row Y for dark peaks
-  ROW_SNAP_MIN_DARK_FRAC: 0.08, // a row position needs ≥8% dark pixels to count as real ink
+  ROW_SNAP_SEARCH_RADIUS: 6,  // search ±6px around expected row Y (was 5)
+  ROW_SNAP_MIN_DARK_FRAC: 0.06, // a row needs ≥6% dark pixels (was 8%, more sensitive)
 
   // Preprocessing
-  GAUSSIAN_SIGMA: 1.0,        // light blur before thresholding
-  CLAHE_TILE_SIZE: 32,        // local histogram equalization tile size (px)
-  MORPH_OPEN_R: 1,            // morphological opening radius to remove dust/speck noise
+  GAUSSIAN_SIGMA: 0.8,        // slightly less blur — preserve ink edge sharpness
+  CLAHE_TILE_SIZE: 24,        // smaller tiles = more local contrast (was 32)
+  MORPH_OPEN_R: 1,            // morphological opening radius
 };
 
 // ── OMR_LAYOUT — derived from omrConfig.ts renderer (single source of truth) ──
@@ -1693,15 +1698,21 @@ function findCornerBlob(grayArr, W, H, searchX0, searchY0, searchX1, searchY1, d
   return { cx: bestSumX / bestArea, cy: bestSumY / bestArea };
 }
 
-// ── FIX 3 + FIX 4: Classify a question given its 4 fill values ───────────────
+// ── Classify a question given its 4 fill values ───────────────────────────────
 //
 // Returns { answer, confidence, isDouble, isBlank }
 //
 // Decision tree:
-//  1. If NO bubble ≥ MIN_FILLED_PERCENT → BLANK
-//  2. If top AND second BOTH ≥ MIN_DOUBLE_FILL AND second/top ≥ DOUBLE_MARK_RATIO → DOUBLE MARK
-//  3. If top ≥ MIN_FILLED_PERCENT AND top/second ≥ MIN_RATIO → answer = top bubble
-//  4. If top ≥ MIN_FILLED_PERCENT but dominance is weak → still pick top (FIX 4: no false blanks)
+//  1. If NO bubble ≥ MIN_FILLED_PERCENT AND no floor hit → BLANK
+//  2. If top AND second BOTH ≥ MIN_DOUBLE_FILL AND second/top ≥ DOUBLE_MARK_RATIO
+//     → TRUE double mark: report as double but ALSO resolve to top (fewer blanks!)
+//  3. If top ≥ MIN_FILLED_PERCENT → answer = top bubble (with confidence)
+//  4. If top < MIN_FILLED_PERCENT but ≥ floor → weak pick (still better than blank)
+//
+// KEY CHANGE from v6: double-marks are now RESOLVED to the darker bubble
+// instead of returned as blank. This matches real-world usage where students
+// lightly tried one bubble then filled another — the darker one is their intent.
+// A question is only flagged isDouble=true when the fills are truly indistinguishable.
 function classifyQuestion(fills, fillFloor, blankStd, qNum) {
   const {
     MIN_FILLED_PERCENT, DOUBLE_MARK_RATIO, MIN_DOUBLE_FILL,
@@ -1715,44 +1726,52 @@ function classifyQuestion(fills, fillFloor, blankStd, qNum) {
 
   const best   = sorted[0];
   const second = sorted[1];
+  const third  = sorted[2];
   const margin = best.f - second.f;
 
-  // FIX 6: Confidence = (topFill - secondFill) × topFill
+  // Confidence = (topFill - secondFill) × topFill
   // High when one bubble strongly dominates; low when two are close
   const rawConfidence = (best.f - second.f) * best.f;
 
-  // Case 1: All bubbles weak → BLANK
+  // Case 1: All bubbles weak → BLANK (or weak-pick if above floor)
   if (best.f < MIN_FILLED_PERCENT) {
-    // FIX 4: if best is at least at the floor (even if < MIN_FILLED_PERCENT),
-    // pick it rather than going blank — reduces false blanks aggressively
-    if (best.f >= fillFloor && best.f >= 0.15) {
+    if (best.f >= fillFloor && best.f >= 0.13) {
       const letter = OPTIONS[best.i];
-      console.log(`[BubbleOMR] Q${qNum}: ${letter} (weak pick: ${(best.f*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
-      return { answer: letter, confidence: rawConfidence * 0.5, isDouble: false, isBlank: false };
+      console.log(`[BubbleOMR] Q${qNum}: ${letter} (floor-pick: ${(best.f*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
+      return { answer: letter, confidence: rawConfidence * 0.4, isDouble: false, isBlank: false };
     }
-    console.log(`[BubbleOMR] Q${qNum}: (blank) best=${(best.f*100).toFixed(1)}% < ${(MIN_FILLED_PERCENT*100).toFixed(0)}% [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
+    console.log(`[BubbleOMR] Q${qNum}: (blank) best=${(best.f*100).toFixed(1)}% [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
     return { answer: '', confidence: 0, isDouble: false, isBlank: true };
   }
 
-  // Case 2: Strict double-mark — BOTH genuinely filled AND very close
-  // FIX 3: require BOTH > MIN_DOUBLE_FILL (28%), ratio >= DOUBLE_MARK_RATIO (82%)
+  // Case 2: Potential double-mark — check if two bubbles are genuinely both filled
   const doubleRatio = second.f > 0.005 ? second.f / best.f : 0;
-  if (
-    best.f >= MIN_DOUBLE_FILL &&
+  const isDoubleCandidate =
+    best.f   >= MIN_DOUBLE_FILL &&
     second.f >= MIN_DOUBLE_FILL &&
-    doubleRatio >= DOUBLE_MARK_RATIO
-  ) {
-    console.log(`[BubbleOMR] Q${qNum}: DOUBLE MARK (top=${(best.f*100).toFixed(1)}% 2nd=${(second.f*100).toFixed(1)}% ratio=${doubleRatio.toFixed(2)}) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
-    return { answer: '', confidence: 0, isDouble: true, isBlank: false };
+    doubleRatio >= DOUBLE_MARK_RATIO;
+
+  if (isDoubleCandidate) {
+    // RESOLVE: pick the darker one — it's almost certainly the real answer.
+    // Only flag isDouble=true if the margin is truly tiny (< 3% absolute).
+    // This eliminates the "18 doubles returned as blank" problem.
+    const absoluteMargin = best.f - second.f;
+    if (absoluteMargin < 0.03) {
+      // Genuinely ambiguous — flag as double (blank) so student can review
+      console.log(`[BubbleOMR] Q${qNum}: TRUE DOUBLE (top=${(best.f*100).toFixed(1)}% 2nd=${(second.f*100).toFixed(1)}% margin=${(absoluteMargin*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
+      return { answer: '', confidence: 0, isDouble: true, isBlank: false };
+    }
+    // One is clearly darker — resolve to it (most common case with ballpen)
+    const letter = OPTIONS[best.i];
+    console.log(`[BubbleOMR] Q${qNum}: ${letter} (resolved double: top=${(best.f*100).toFixed(1)}% 2nd=${(second.f*100).toFixed(1)}% margin=${(absoluteMargin*100).toFixed(1)}%) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
+    return { answer: letter, confidence: rawConfidence * 0.75, isDouble: false, isBlank: false };
   }
 
-  // Case 3 + 4: Pick the best answer
-  // Even if ratio < MIN_RATIO, still pick the top if it's clearly filled.
-  // FIX 4: Don't return blank just because the runner-up is slightly high.
+  // Case 3: Normal — pick the top bubble
   const letter = OPTIONS[best.i];
   const dominanceRatio = second.f > 0.005 ? best.f / second.f : best.f / 0.005;
   const isStrong = dominanceRatio >= MIN_RATIO;
-  const confidence = isStrong ? rawConfidence : rawConfidence * 0.6;
+  const confidence = isStrong ? rawConfidence : rawConfidence * 0.65;
 
   console.log(`[BubbleOMR] Q${qNum}: ${letter} (fill=${(best.f*100).toFixed(1)}% margin=${(margin*100).toFixed(1)}% ratio=${dominanceRatio.toFixed(2)}) [${fills.map(f=>(f*100).toFixed(1)+'%').join(', ')}]`);
   return { answer: letter, confidence, isDouble: false, isBlank: false };
@@ -2005,9 +2024,9 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
   const confidence = Math.min(0.99, scaledConf * (0.7 + 0.3 * fillRate) - doubleMarked * 0.015);
 
   if (doubleMarked > 0) {
-    console.warn(`[BubbleOMR] ⚠️  ${doubleMarked} double-marked question(s) — returned as blank`);
+    console.warn(`[BubbleOMR] ⚠️  ${doubleMarked} TRUE double-marked question(s) — returned as blank (student must re-scan or erase)`);
   }
-  console.log(`[BubbleOMR] Done — answered: ${answeredCount}/${questionCount}, doubles: ${doubleMarked}, confidence: ${(Math.max(0, confidence)*100).toFixed(1)}%`);
+  console.log(`[BubbleOMR] Done — answered: ${answeredCount}/${questionCount}, true-doubles: ${doubleMarked}, confidence: ${(Math.max(0, confidence)*100).toFixed(1)}%`);
 
   return {
     studentName:      null,
@@ -2324,8 +2343,10 @@ if (isBubble) {
       const processed = await sharp(inputBuf)
         .rotate()                                          // fix EXIF orientation
         .greyscale()                                       // remove colour cast
-        .modulate({ brightness: 1.08 })                   // lift dark phone shots
-        .normalise()                                       // stretch full contrast range
+        .modulate({ brightness: 1.10, contrast: 1.15 })   // lift dark shots + boost ink contrast
+        .normalise()                                       // stretch full 0-255 range
+        .median(3)                                         // reduce phone camera noise
+        .sharpen({ sigma: 1.2, m1: 1.0, m2: 0.5 })        // sharpen bubble edges
         .png()
         .toBuffer();
       processedBase64 = processed.toString('base64');
@@ -3293,7 +3314,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '6.2-omr-bubble-step-fix',
+  version: '7.0-smart-double-resolve',
 }));
 
 // Error handler
@@ -3303,7 +3324,7 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('[AutoChecker] v3.0 running on http://0.0.0.0:' + PORT);
+  console.log('[AutoChecker] v7.0 running on http://0.0.0.0:' + PORT);
   console.log('[AutoChecker] OCR: Tesseract.js LSTM (OEM set at worker init) + ' + (sharp ? 'sharp preprocessing enabled' : 'NO sharp -- run: npm install sharp'));
   console.log('[AutoChecker] Groq vision: ' + (groqReady ? 'ready ✓' : GROQ_API_KEY ? 'key set, probe pending...' : 'not configured (add GROQ_API_KEY)'));
   console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
@@ -3315,4 +3336,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260525-omr-bestcx-fix-groq-prompt-v13
+// redeploy-trigger-20260526-v7-smart-double-resolve-accuracy-fix
