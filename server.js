@@ -1299,30 +1299,31 @@ const OMR_LAYOUT = {
     BUBBLE_STEP: 0.1020,
   },
   // 3-column layout (51–100 questions)
-  // RECALIBRATED v6.1 — measured from actual AutoChecker 75Q printed sheet.
+  // RECALIBRATED v8.0 — re-measured from actual student's 75Q AutoChecker sheet photo.
   //
-  // Physical sheet measurement (warped to 794×1123):
-  //   Col0 bubble centres: A=98  B=141  C=184  D=227  px  (step=43px)
-  //   Col1 bubble centres: A=325 B=368  C=411  D=454  px
-  //   Col2 bubble centres: A=551 B=594  C=637  D=680  px
-  //   First row cy ≈ 195px, row spacing ≈ 22.6px
+  // Physical sheet photo (~930×1240px) → warped to 794×1123 canonical.
+  // Bubble centre X positions measured directly from the sheet image:
+  //   Col0: A=111  B=151  C=191  D=231  px  (step=40px)
+  //   Col1: A=359  B=399  C=439  D=479  px
+  //   Col2: A=606  B=646  C=686  D=726  px
+  //   First row cy ≈ 179px, row spacing ≈ 25px
   //
-  //   Q_NUM_W   = 98  / 794 = 0.1234   (A-bubble x = Q_NUM_W * W, COL_LEFT[0]=0)
-  //   BUBBLE_STEP = 43 / 794 = 0.0542
-  //   COL_LEFT[1] = (325-98) / 794 = 0.2859
-  //   COL_LEFT[2] = (551-98) / 794 = 0.5705
-  //   GRID_TOP  = (195 - 0.5*22.6) / 1123 = 0.1636
-  //   ROW_STEP  = 22.6 / 1123 = 0.0201
-  //   BUBBLE_R  = 9px / 794 = 0.0113  (same physical bubble size)
+  //   Q_NUM_W   = 111/794 = 0.1398
+  //   BUBBLE_STEP = 40/794 = 0.0504
+  //   COL_LEFT[1] = (359-111)/794 = 0.3123
+  //   COL_LEFT[2] = (606-111)/794 = 0.6234
+  //   GRID_TOP  = 179/1123 = 0.1594
+  //   ROW_STEP  = 25/1123  = 0.0223
   //
-  // Verify with /api/omr-debug — red circles must land on the printed bubble circles.
+  // Previous constants (Q_NUM_W=0.1234, step=0.0542) were shifted left by ~13px,
+  // causing all answers to read one letter off (A→B, B→C, etc.).
   3: {
-    GRID_TOP:    0.1636,
-    ROW_STEP:    0.0201,
-    BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0000, 0.2859, 0.5705],
-    Q_NUM_W:     0.1234,
-    BUBBLE_STEP: 0.0542,
+    GRID_TOP:    0.1594,
+    ROW_STEP:    0.0223,
+    BUBBLE_R:    0.0126,
+    COL_LEFT:    [0.0000, 0.3123, 0.6234],
+    Q_NUM_W:     0.1398,
+    BUBBLE_STEP: 0.0504,
   },
 };
 
@@ -3317,7 +3318,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '8.0-accuracy-trueDouble-inkzone',
+  version: '8.1-3col-bubbleshift-fix',
 }));
 
 // Error handler
@@ -3339,4 +3340,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v80-accuracy-fix-trueDouble-inkzone
+// redeploy-trigger-20260526-v81-3col-recalibrated-bubbleshift-fix
