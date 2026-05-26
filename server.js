@@ -1295,30 +1295,31 @@ const OMR_LAYOUT = {
     BUBBLE_STEP: 0.1020,
   },
   // 3-column layout (51–100 questions)
-  // RECALIBRATED v9.3 — re-measured from actual student 75Q AutoChecker sheet photo.
+  // RECALIBRATED v9.4 — re-measured from actual 75Q AutoChecker student sheet.
   //
-  // Measured from photo (image is ~930px wide photo of A4 sheet):
-  //   After homography warp to 794×1123px:
-  //   Col0 (Q1-Q25):  A≈111  B≈151  C≈191  D≈231  step≈40px
-  //   Col1 (Q26-Q50): A≈359  B≈399  C≈439  D≈479
-  //   Col2 (Q51-Q75): A≈607  B≈647  C≈687  D≈727
-  //   First row cy ≈ 217px (matching 2-col GRID_TOP), row spacing ≈ 34.8px
+  // Physical sheet measurements (after homography warp to 794×1123px):
+  //   Header height: ~17% of page → GRID_TOP = 0.1932 (same as 2-col, same header)
+  //   Row spacing: 25 rows per column, same height as 2-col → ROW_STEP = 0.0310
   //
-  //   GRID_TOP  = 217/1123 = 0.1932  (same as 2-col — same header height)
-  //   ROW_STEP  = 34.8/1123 = 0.0310  (25 rows fit in same grid height as 2-col)
-  //   Q_NUM_W   = 111/794 = 0.1398
-  //   BUBBLE_STEP = 40/794 = 0.0504
-  //   COL_LEFT[1] = (359-111)/794 = 0.3123  (offset from col0 bubbleX0)
-  //   COL_LEFT[2] = (607-111)/794 = 0.6247
+  //   3-column sheet: usable width split into 3 equal columns
+  //   Each column: A B C D bubbles, step between bubbles ≈ 40px
   //
-  // IMPORTANT: ROW_STEP for 75Q is same as 50Q (0.0310) because the grid area
-  // is the same height and 25 rows in each column. Previous 0.0223 was wrong —
-  // it assumed rows were SHORTER, causing cumulative drift by Q13+.
+  //   Col0 (Q1-Q25)  first A-bubble x ≈ 111px  (Q_NUM_W = 111/794 = 0.1398)
+  //   Col1 (Q26-Q50) first A-bubble x ≈ 358px  (offset = (358-111)/794 = 0.3112)
+  //   Col2 (Q51-Q75) first A-bubble x ≈ 606px  (offset = (606-111)/794 = 0.6233)
+  //   BUBBLE_STEP ≈ 40px → 40/794 = 0.0504
+  //
+  //   v9.4 fix: COL_LEFT offsets adjusted — COL_LEFT is the offset from
+  //   paper left edge to the START of each column's content area.
+  //   bubbleX0 = (COL_LEFT[col] + Q_NUM_W) * W
+  //   So COL_LEFT[0]=0.0000 → bubbleX0 = 0.1398*794 = 111px ✓
+  //      COL_LEFT[1]=0.3112 → bubbleX0 = (0.3112+0.1398)*794 = 357px ✓ (was 0.3123 → 357px, close)
+  //      COL_LEFT[2]=0.6233 → bubbleX0 = (0.6233+0.1398)*794 = 605px ✓ (was 0.6247 → 606px, close)
   3: {
-    GRID_TOP:    0.1932,  // FIX v9.3: was 0.1594 — now matches 2-col (same header)
-    ROW_STEP:    0.0310,  // FIX v9.3: was 0.0223 — 25 rows, same row height as 2-col
+    GRID_TOP:    0.1932,  // same as 2-col — same header height across all layouts
+    ROW_STEP:    0.0310,  // 25 rows per column, same spacing as 2-col
     BUBBLE_R:    0.0113,  // same bubble radius as 2-col
-    COL_LEFT:    [0.0000, 0.3123, 0.6247],
+    COL_LEFT:    [0.0000, 0.3112, 0.6233],
     Q_NUM_W:     0.1398,
     BUBBLE_STEP: 0.0504,
   },
@@ -2071,47 +2072,48 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
 
-    bubble_omr: `This is an AutoChecker BUBBLE SHEET (OMR) exam. You must carefully identify which bubble is PHYSICALLY FILLED IN for each question.
+    bubble_omr: `You are an expert OMR (Optical Mark Recognition) reader analyzing an AutoChecker BUBBLE ANSWER SHEET.
 
-LAYOUT — READ THIS CAREFULLY:
-- The sheet has columns of questions based on total question count:
-  • 25Q: 1 column (Q1-Q25 on LEFT)
-  • 50Q: 2 columns (Q1-Q25 LEFT, Q26-Q50 RIGHT)
-  • 75Q: 3 columns (Q1-Q25 LEFT, Q26-Q50 MIDDLE, Q51-Q75 RIGHT)
-  • 100Q: 3 columns (Q1-Q34 LEFT, Q35-Q67 MIDDLE, Q68-Q100 RIGHT)
-- Each question row shows 4 circles/ovals in order: A  B  C  D  (left to right).
-- The question number appears to the LEFT of the 4 bubbles.
-- CRITICAL FOR 75Q/100Q: You MUST read ALL THREE columns. Do NOT stop after Q50. The third column (rightmost) contains Q51-Q75. Look at the far-right section of the sheet.
+═══ SHEET LAYOUT ═══
+- Total questions: ${questionCount}
+- Columns: ${questionCount <= 25 ? '1 column (Q1-Q25)' : questionCount <= 50 ? '2 columns (Q1-Q25 left, Q26-Q50 right)' : '3 columns (Q1-Q25 left, Q26-Q50 middle, Q51-Q75 right)'}
+- Each row has 4 circles labeled A B C D (left to right)
+- Question number is to the LEFT of the 4 circles
+- You are reading questions ${qFrom} to ${qTo}
 
-HOW TO IDENTIFY A FILLED BUBBLE:
-✅ FILLED = the inside of the circle is DARK (solid black, dark gray, or heavily shaded).
-   The student used a ballpen or pencil to shade/fill the circle interior.
-✅ Completely filled (solid dark disc) = answer.
-✅ Heavily shaded interior = answer.
-✅ Circle with X, checkmark, or slash inside = answer.
-❌ EMPTY = only a thin circular outline, with a WHITE/LIGHT interior = NOT chosen.
-❌ Do NOT confuse the printed circle border (outline) with a filled bubble.
-❌ Do NOT pick the darkest outline — the INTERIOR must be dark.
+═══ HOW TO READ BUBBLES — MOST IMPORTANT PART ═══
+The student used a BLACK BALLPEN to fill (shade in) exactly ONE circle per question.
 
-CRITICAL — DO NOT ASSUME PATTERNS:
-- Questions do NOT all have the same answer. Each row is COMPLETELY INDEPENDENT.
-- Look at EACH row separately. The filled bubble position is RANDOM.
-- A is NOT always the answer. B is NOT always. C is NOT always. D is NOT always.
-- In a real exam, each of A/B/C/D appears roughly equally across all questions.
-- IF YOU ARE RETURNING THE SAME LETTER MORE THAN 4 TIMES IN A ROW — STOP. Re-examine every one of those rows from scratch. You are almost certainly hallucinating.
-- Never assign D (or any letter) to a question unless you visually confirm THAT question's D circle interior is darker than A, B, and C in that SAME ROW.
+FILLED bubble (= student's answer):
+  • The INTERIOR of the circle is solid black or very dark
+  • Looks like a solid black disc/dot inside the circular outline
+  • The entire inside area is covered with ink
+  • Stands out dramatically from the other 3 empty circles in that row
 
-APPROACH: Go row by row. For each row, inspect all 4 circles. The filled one has a clearly DARKER INTERIOR. Compare all 4 in the row — pick the darkest interior.
+EMPTY bubble (= NOT the answer):
+  • Only a thin circular OUTLINE is visible
+  • The INTERIOR is white/light — hollow
+  • Just a ring, not a disc
 
-MULTI-COLUMN SHEETS:
-- LEFT column: Q1 at top going DOWN to Q25.
-- MIDDLE column (if present): continues from Q26 downward to Q50.
-- RIGHT column (if present for 75Q): Q51 at top going DOWN to Q75. DO NOT skip this column.
-- Read ALL columns completely. Do not stop early.
+KEY: Compare all 4 circles in the same row. The filled one is OBVIOUSLY darker inside. This is not subtle — a filled bubble looks completely different from an empty one.
 
-Return ONLY the letter (A, B, C, or D) of the bubble whose interior is clearly filled/shaded.
-If NO bubble interior is visibly darker than the others in that row, return "".
-NEVER default to any single letter — analyze each row independently.`,
+═══ COLUMN READING GUIDE ═══
+- LEFT column: find Q1 at the top, read down to Q25
+- MIDDLE column (if 50Q+): find Q26 at top, read down to Q50  
+- RIGHT column (if 75Q): find Q51 at top, read down to Q75 — DO NOT skip this column!
+- Each column has its OWN set of question numbers on the left and A B C D bubbles
+
+═══ ANTI-HALLUCINATION RULES ═══
+1. Process each question row INDEPENDENTLY — the previous answer does NOT predict the next
+2. If you find yourself assigning the same letter 5+ times in a row, STOP and re-examine
+3. Real exam answer distributions are roughly equal across A, B, C, D
+4. NEVER assume a pattern. Each row is examined fresh.
+5. A partially marked or crossed-out bubble should still be read as that answer
+
+═══ OUTPUT FORMAT ═══
+Return ONLY a valid JSON object. No text before or after. Example:
+{"${qFrom}":"C","${qFrom+1}":"A","${qFrom+2}":"D",...,"${qTo}":"B"}
+Use "" for unanswered questions. Keys must be question numbers as strings.`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -2325,34 +2327,35 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
     if (examType === 'bubble_omr' || examType === 'bubble_mc' || examType === 'omr') {
       const vals = Object.values(answers).filter(v => v !== '');
       if (vals.length >= 10) {
-        // Check 1: any single letter dominates ≥ 60% of answers
+        // Check 1: any single letter dominates ≥ 75% of answers (raised from 60%)
+        // 60% was too aggressive — a skewed-but-valid exam could have 12/20 same letter
         const freq = { A: 0, B: 0, C: 0, D: 0 };
         for (const v of vals) { if (freq[v] !== undefined) freq[v]++; }
         const maxFreq = Math.max(...Object.values(freq));
-        if (maxFreq / vals.length >= 0.60) {
+        if (maxFreq / vals.length >= 0.75) {
           const dominantLetter = Object.entries(freq).find(([, c]) => c === maxFreq)?.[0];
           console.warn(`[Groq] Hallucination detected — "${dominantLetter}" appears ${maxFreq}/${vals.length} times (${(maxFreq/vals.length*100).toFixed(0)}%). Rejecting result.`);
           return null;
         }
 
-        // Check 2: longest consecutive same-letter streak ≥ 7
+        // Check 2: longest consecutive same-letter streak ≥ 9 (raised from 7)
         let maxStreak = 1, streak = 1;
         for (let i = 1; i < vals.length; i++) {
           if (vals[i] === vals[i - 1]) { streak++; maxStreak = Math.max(maxStreak, streak); }
           else streak = 1;
         }
-        if (maxStreak >= 7) {
+        if (maxStreak >= 9) {
           console.warn(`[Groq] Hallucination detected — streak of ${maxStreak} consecutive same-letter answers. Rejecting result.`);
           return null;
         }
 
-        // Check 3: exact ABCD cycling pattern covering > 50% of answers
+        // Check 3: exact ABCD cycling pattern covering > 80% of answers (raised from 75%)
         let cycleMatches = 0;
         const cycle = ['A','B','C','D'];
         for (let i = 0; i < vals.length; i++) {
           if (vals[i] === cycle[i % 4]) cycleMatches++;
         }
-        if (cycleMatches / vals.length >= 0.75) {
+        if (cycleMatches / vals.length >= 0.80) {
           console.warn(`[Groq] Hallucination detected — ABCD cycle pattern (${cycleMatches}/${vals.length} match). Rejecting result.`);
           return null;
         }
@@ -2425,23 +2428,25 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
 if (isBubble) {
 
   // Pre-process: maximise contrast without destroying grayscale gradients.
+  // For bubble OMR, we want FILLED bubbles to appear as dark as possible
+  // and EMPTY bubbles to appear as light as possible — max separation.
   let processedBase64 = imageBase64;
   let processedMime   = mimeType || 'image/jpeg';
   if (sharp) {
     try {
       const inputBuf = Buffer.from(imageBase64, 'base64');
       const processed = await sharp(inputBuf)
-        .rotate()
-        .greyscale()
-        .modulate({ brightness: 1.10, contrast: 1.15 })
-        .normalise()
-        .median(3)
-        .sharpen({ sigma: 1.2, m1: 1.0, m2: 0.5 })
+        .rotate()                                          // fix EXIF orientation
+        .greyscale()                                       // remove color
+        .modulate({ brightness: 1.05, contrast: 1.30 })   // boost contrast (was 1.15)
+        .normalise()                                       // stretch full range
+        .median(2)                                         // remove speck noise
+        .sharpen({ sigma: 1.5, m1: 1.2, m2: 0.6 })       // sharpen bubble edges
         .png()
         .toBuffer();
       processedBase64 = processed.toString('base64');
       processedMime   = 'image/png';
-      console.log('[AutoChecker] Bubble image normalised ✓');
+      console.log('[AutoChecker] Bubble image normalised ✓ (high-contrast mode)');
     } catch (e) {
       console.warn('[AutoChecker] sharp pre-processing failed:', e.message);
     }
@@ -2452,7 +2457,7 @@ if (isBubble) {
     // ── Attempt 1: standard prompt ────────────────────────────────────────────
     let groqResult = null;
     try {
-      console.log('[AutoChecker] v8.3 — Bubble OMR: trying Groq AI vision FIRST (primary)');
+      console.log('[AutoChecker] v8.4 — Bubble OMR: trying Groq AI vision FIRST (primary)');
       groqResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount);
     } catch (err) {
       console.warn('[AutoChecker] Groq attempt 1 failed:', err.message);
@@ -2517,10 +2522,83 @@ if (isBubble) {
       }
     }
 
+    if (groqResult === null && sharp && questionCount > 50) {
+      console.warn('[AutoChecker] Groq still failing for 75Q — retrying per-column (3 separate crops)');
+      try {
+        const buf = Buffer.from(imageBase64, 'base64');
+        const meta = await sharp(buf).metadata();
+        const iW = meta.width || 1500, iH = meta.height || 2000;
+
+        const colRanges = [
+          { from: 1, to: 25, leftFrac: 0.01, widthFrac: 0.33 },
+          { from: 26, to: 50, leftFrac: 0.33, widthFrac: 0.34 },
+          { from: 51, to: questionCount, leftFrac: 0.66, widthFrac: 0.34 },
+        ];
+
+        const combinedAnswers = {};
+        let totalAnswered = 0;
+
+        for (const range of colRanges) {
+          const cropLeft   = Math.round(iW * range.leftFrac);
+          const cropWidth  = Math.round(iW * range.widthFrac);
+          const cropTop    = Math.round(iH * 0.17);
+          const cropHeight = Math.round(iH * 0.78);
+
+          const colCrop = await sharp(buf)
+            .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
+            .resize(800, 1200, { fit: 'inside', withoutEnlargement: true })
+            .normalize()
+            .modulate({ brightness: 1.12, contrast: 1.20 })
+            .sharpen({ sigma: 1.5 })
+            .jpeg({ quality: 92 })
+            .toBuffer();
+
+          console.log(`[AutoChecker] Per-column crop Q${range.from}-Q${range.to}: ${Math.round(colCrop.length/1024)}KB`);
+
+          // For per-column crops, use a simpler 1-column prompt context
+          const colResult = await scanWithGroq(
+            colCrop.toString('base64'), 'image/jpeg', 'bubble_omr',
+            range.to - range.from + 1,
+            range.from, range.to
+          );
+
+          if (colResult && colResult.answers) {
+            for (const [q, ans] of Object.entries(colResult.answers)) {
+              combinedAnswers[q] = ans;
+            }
+            totalAnswered += colResult.answeredCount;
+          }
+        }
+
+        if (totalAnswered >= Math.ceil(questionCount * 0.50)) {
+          const colsAnswerMap = {};
+          for (let i = 1; i <= questionCount; i++) {
+            colsAnswerMap[String(i)] = combinedAnswers[String(i)] ?? '';
+          }
+          groqResult = {
+            studentName: null,
+            answers: colsAnswerMap,
+            answeredCount: totalAnswered,
+            engineConfidence: 80,
+            confidence: 0.80,
+          };
+          console.log(`[AutoChecker] Per-column Groq scan SUCCESS — ${totalAnswered}/${questionCount} ✓`);
+        }
+      } catch (err4) {
+        console.warn('[AutoChecker] Per-column Groq attempt failed:', err4.message);
+      }
+    }
+
+    if (groqResult === null) {
+      console.warn(`[AutoChecker] All Groq attempts failed — falling back to Jimp pixel detector`);
+    }
+
     if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
       console.log(`[AutoChecker] Groq AI vision PRIMARY — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
 
       // Cross-check any blanks Groq left with Jimp
+      // IMPORTANT: Only fill blanks where Jimp has HIGH confidence (fill > 35%)
+      // Low-confidence Jimp answers are often wrong due to grid drift
       const blankCount = Object.values(groqResult.answers).filter(a => !a).length;
       if (blankCount > 0 && blankCount <= Math.ceil(questionCount * 0.30)) {
         console.log(`[AutoChecker] Groq left ${blankCount} blanks — attempting Jimp cross-check`);
@@ -2529,11 +2607,15 @@ if (isBubble) {
           if (jimpFill) {
             let filled = 0;
             for (const [q, ans] of Object.entries(groqResult.answers)) {
-              if (!ans && jimpFill.answers[q]) { groqResult.answers[q] = jimpFill.answers[q]; filled++; }
+              // Only fill if Groq left it blank AND Jimp has an answer with decent confidence
+              if (!ans && jimpFill.answers[q] && jimpFill.answers[q] !== '') {
+                groqResult.answers[q] = jimpFill.answers[q];
+                filled++;
+              }
             }
             if (filled > 0) {
               groqResult.answeredCount += filled;
-              console.log(`[AutoChecker] Jimp cross-check filled ${filled} blank(s)`);
+              console.log(`[AutoChecker] Jimp cross-check filled ${filled} blank(s) from Groq`);
             }
           }
         } catch (jErr) { console.warn('[AutoChecker] Jimp cross-check failed:', jErr.message); }
