@@ -2066,16 +2066,44 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   const qTo   = toQ   ?? questionCount;
   const rangeDesc = (fromQ && toQ) ? `questions ${qFrom} to ${qTo}` : `all ${questionCount} questions`;
 
+  // ── FIX 1: Build exact column layout from questionCount ──────────────────────
+  // Old code hardcoded "2 columns: Q1-Q25 LEFT, Q26-Q50 RIGHT" which is WRONG for
+  // 75-question sheets (3 cols) and misleading for any sheet. Groq was misreading
+  // column assignments and producing wrong letter offsets (A→B, C→D etc.).
+  function buildColumnLayout(qCount) {
+    if (qCount <= 25) {
+      return `EXACT COLUMN LAYOUT (${qCount} questions, 1 column):
+- ONLY COLUMN (centre): Q1 at top → Q${qCount} at bottom
+- Each row: question number on LEFT, then 4 bubbles: A  B  C  D`;
+    }
+    if (qCount <= 50) {
+      const half = Math.ceil(qCount / 2);
+      return `EXACT COLUMN LAYOUT (${qCount} questions, 2 columns):
+- LEFT column:  Q1  at top → Q${half} at bottom
+- RIGHT column: Q${half + 1} at top → Q${qCount} at bottom
+- Each row: question number on LEFT of that column's 4 bubbles: A  B  C  D
+- IMPORTANT: The RIGHT column is a SEPARATE grid — its question numbers restart from ${half + 1}, not from 1.`;
+    }
+    // 51–75 questions → 3 columns
+    const col1End = Math.ceil(qCount / 3);
+    const col2End = Math.ceil(qCount * 2 / 3);
+    return `EXACT COLUMN LAYOUT (${qCount} questions, 3 columns):
+- LEFT column:   Q1       at top → Q${col1End}    at bottom
+- MIDDLE column: Q${col1End + 1}     at top → Q${col2End}    at bottom
+- RIGHT column:  Q${col2End + 1}     at top → Q${qCount}    at bottom
+- Each row: question number on LEFT of that column's 4 bubbles: A  B  C  D
+- CRITICAL: Each column is an independent grid. Do NOT continue row numbers across columns.
+- CRITICAL: Read each column fully top-to-bottom before moving to the next.`;
+  }
+  const columnLayout = buildColumnLayout(questionCount);
+
   // Per-type instructions — explicitly distinguish printed text from handwritten answers.
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
 
     bubble_omr: `This is an AutoChecker BUBBLE SHEET (OMR) exam. You must carefully identify which bubble is PHYSICALLY FILLED IN for each question.
 
-LAYOUT — READ THIS CAREFULLY:
-- The sheet has columns of questions (e.g. 2 columns: Q1-Q25 on the LEFT, Q26-Q50 on the RIGHT; or 3 columns for 75Q).
-- Each question row shows 4 circles/ovals in order: A  B  C  D  (left to right).
-- The question number appears to the LEFT of the 4 bubbles.
+${columnLayout}
 
 HOW TO IDENTIFY A FILLED BUBBLE:
 ✅ FILLED = the inside of the circle is DARK (solid black, dark gray, or heavily shaded).
@@ -2090,17 +2118,13 @@ HOW TO IDENTIFY A FILLED BUBBLE:
 CRITICAL — DO NOT ASSUME PATTERNS:
 - Questions do NOT all have the same answer. Each row is independent.
 - Look at EACH row separately. The filled bubble position varies per question.
-- A is NOT always the answer. B is NOT always the answer.
+- A is NOT always the answer. B is NOT always the answer. D is NOT always the answer.
 - Compare the 4 bubbles in a row: only the one with a DARK INTERIOR is chosen.
-
-MULTI-COLUMN SHEETS:
-- LEFT column: Q1 at top going DOWN to Q25 (or Q50 for 1-col sheets).
-- RIGHT column: continues from Q26 downward (or Q51 for 3-col sheets).
-- Read ALL columns. Do not stop at Q25.
+- If you find yourself returning the same letter (e.g. D) for 5+ consecutive questions, STOP and re-examine — that is almost certainly a hallucination. Re-read those rows carefully.
 
 Return ONLY the letter (A, B, C, or D) of the bubble whose interior is clearly filled/shaded.
 If NO bubble interior is visibly darker than the others in that row, return "".
-NEVER default to B or any single letter — analyze each row independently.`,
+NEVER default to B or D or any single letter — analyze each row independently.`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -2205,23 +2229,47 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
   try {
     console.log(`[Groq] Scanning ${examType} — ${rangeDesc}`);
 
-    // ── Compress image before sending to Groq ────────────────────────────────
+    // ── FIX 2: Compress image before sending to Groq with minimum quality floor ──
     // Groq rejects images larger than ~4MB (413 error). Phone photos are often
     // 3120×4160px (13MP) = 12–20MB base64. Resize to max 1600px on longest side.
+    // CRITICAL: if the compressed result drops below 800KB the bubbles become too
+    // blurry for Groq to distinguish filled vs empty — use a quality floor of 90
+    // for bubble sheets (less aggressive compression = better bubble visibility).
     let groqImageBase64 = imageBase64;
     let groqMimeType    = mimeType || 'image/jpeg';
     if (sharp) {
       try {
         const inputBuf = Buffer.from(imageBase64, 'base64');
+        // For bubble sheets: max 2000px (more resolution = clearer bubbles),
+        // quality=90 initial, fallback to quality=95 PNG if result < 800KB.
+        const isBubbleType = examType === 'bubble_omr' || examType === 'bubble_mc' || examType === 'omr';
+        const maxDim  = isBubbleType ? 2000 : 1600;
+        const quality = isBubbleType ? 90   : 85;
+
         const compressed = await sharp(inputBuf)
-          .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: 85 })
+          .resize(maxDim, maxDim, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality })
           .toBuffer();
-        groqImageBase64 = compressed.toString('base64');
-        groqMimeType    = 'image/jpeg';
+
         const origKB = Math.round(imageBase64.length * 0.75 / 1024);
         const compKB = Math.round(compressed.length / 1024);
-        console.log(`[Groq] Image compressed: ${origKB}KB → ${compKB}KB`);
+
+        // FIX: if compressed result is smaller than 800KB the bubbles may be too
+        // blurry. Re-encode at higher quality / smaller resize to preserve detail.
+        if (isBubbleType && compressed.length < 800_000) {
+          console.warn(`[Groq] Compressed too small (${compKB}KB) — retrying at higher quality to preserve bubble detail`);
+          const highQ = await sharp(inputBuf)
+            .resize(1800, 1800, { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 95 })
+            .toBuffer();
+          groqImageBase64 = highQ.toString('base64');
+          groqMimeType    = 'image/jpeg';
+          console.log(`[Groq] Image compressed: ${origKB}KB → ${Math.round(highQ.length/1024)}KB (high-quality retry)`);
+        } else {
+          groqImageBase64 = compressed.toString('base64');
+          groqMimeType    = 'image/jpeg';
+          console.log(`[Groq] Image compressed: ${origKB}KB → ${compKB}KB`);
+        }
       } catch (compErr) {
         console.warn('[Groq] Image compression failed, using original:', compErr.message);
       }
@@ -2286,6 +2334,25 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
       for (const k of Object.keys(answers)) {
         const v = answers[k].trim().toUpperCase();
         answers[k] = ['A', 'B', 'C', 'D'].includes(v) ? v : '';
+      }
+
+      // ── FIX 3: Hallucination / uniform-run detection ──────────────────────
+      // If Groq returns the same letter for 8+ consecutive questions, that is
+      // statistically impossible in a real exam and indicates a hallucination
+      // (Groq "got stuck" on a single letter, usually B or D). Mark as invalid
+      // so the caller falls back to Jimp pixel detection.
+      function detectUniformRun(ans, runLength = 8) {
+        const vals = Object.values(ans).filter(Boolean);
+        for (let i = 0; i <= vals.length - runLength; i++) {
+          const slice = vals.slice(i, i + runLength);
+          if (slice.every(v => v === slice[0])) return slice[0];
+        }
+        return null;
+      }
+      const badLetter = detectUniformRun(answers);
+      if (badLetter) {
+        console.warn(`[Groq] ⚠️  Hallucination detected — "${badLetter}" repeats for 8+ consecutive questions. Discarding result.`);
+        return null; // signal caller to fall back to Jimp
       }
     }
 
@@ -2367,24 +2434,38 @@ async function parseVisionText(imageBase64, mimeType, examType, questionCount, q
   // Jimp pixel detector is kept as fallback for when Groq is unavailable.
 if (isBubble) {
 
-  // Pre-process: maximise contrast without destroying grayscale gradients.
+  // ── FIX 4: Better preprocessing for bubble sheets ─────────────────────────
+  // Old preprocessing (greyscale + modulate + normalise + median + sharpen) was
+  // converting to PNG at whatever size came in, sometimes producing 371KB blobs.
+  // New: resize to 2000px first (preserves bubble detail), then enhance contrast,
+  // then apply unsharp mask to make bubble boundaries crisp for Groq.
   let processedBase64 = imageBase64;
   let processedMime   = mimeType || 'image/jpeg';
   if (sharp) {
     try {
       const inputBuf = Buffer.from(imageBase64, 'base64');
       const processed = await sharp(inputBuf)
-        .rotate()
+        .rotate()                                              // auto-rotate from EXIF
+        .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
         .greyscale()
-        .modulate({ brightness: 1.10, contrast: 1.15 })
-        .normalise()
-        .median(3)
-        .sharpen({ sigma: 1.2, m1: 1.0, m2: 0.5 })
-        .png()
+        .normalize()                                           // stretch histogram to 0–255
+        .modulate({ brightness: 1.08, contrast: 1.20 })       // lift faint ballpen marks
+        .median(3)                                             // remove salt-and-pepper noise
+        .sharpen({ sigma: 1.5, m1: 1.5, m2: 0.8 })           // crisp bubble edges
+        .jpeg({ quality: 92 })                                 // keep quality high for Groq
         .toBuffer();
-      processedBase64 = processed.toString('base64');
-      processedMime   = 'image/png';
-      console.log('[AutoChecker] Bubble image normalised ✓');
+
+      const origKB = Math.round(imageBase64.length * 0.75 / 1024);
+      const procKB = Math.round(processed.length / 1024);
+
+      // Quality floor: if result < 700KB, something went wrong — use original
+      if (processed.length < 700_000) {
+        console.warn(`[AutoChecker] Preprocessed image too small (${procKB}KB) — using original`);
+      } else {
+        processedBase64 = processed.toString('base64');
+        processedMime   = 'image/jpeg';
+        console.log(`[AutoChecker] Bubble image preprocessed: ${origKB}KB → ${procKB}KB ✓`);
+      }
     } catch (e) {
       console.warn('[AutoChecker] sharp pre-processing failed:', e.message);
     }
@@ -2393,13 +2474,47 @@ if (isBubble) {
   // PRIMARY: Groq AI vision — reads filled bubbles visually, angle-tolerant
   if (groqReady) {
     try {
-      console.log('[AutoChecker] v8.2 — Bubble OMR: trying Groq AI vision FIRST (primary)');
+      console.log('[AutoChecker] v8.3 — Bubble OMR: trying Groq AI vision FIRST (primary)');
       const groqResult = await scanWithGroq(processedBase64, processedMime, 'bubble_omr', questionCount);
+
+      // groqResult === null means hallucination was detected inside scanWithGroq (Fix 3)
       if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
         console.log(`[AutoChecker] Groq AI vision PRIMARY — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
+
+        // ── FIX 5: Cross-check blanks with Jimp when Groq left some unanswered ──
+        // Groq occasionally returns "" for questions it's uncertain about (especially
+        // the 3rd column on 75Q sheets). Run Jimp on the same image and fill in any
+        // blanks Groq couldn't answer, rather than leaving them empty.
+        const blankCount = Object.values(groqResult.answers).filter(a => !a).length;
+        if (blankCount > 0 && blankCount <= Math.ceil(questionCount * 0.30)) {
+          console.log(`[AutoChecker] Groq left ${blankCount} blanks — attempting Jimp cross-check for those questions`);
+          try {
+            const jimpFill = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
+            if (jimpFill) {
+              let filled = 0;
+              for (const [q, ans] of Object.entries(groqResult.answers)) {
+                if (!ans && jimpFill.answers[q]) {
+                  groqResult.answers[q] = jimpFill.answers[q];
+                  filled++;
+                }
+              }
+              if (filled > 0) {
+                groqResult.answeredCount += filled;
+                console.log(`[AutoChecker] Jimp cross-check filled ${filled} blank(s) from Groq result`);
+              }
+            }
+          } catch (jErr) {
+            console.warn('[AutoChecker] Jimp cross-check failed (non-critical):', jErr.message);
+          }
+        }
+
         return groqResult;
       }
-      console.warn(`[AutoChecker] Groq returned only ${groqResult?.answeredCount ?? 0}/${questionCount} — trying Jimp fallback`);
+      if (groqResult === null) {
+        console.warn('[AutoChecker] Groq hallucination detected — falling back to Jimp');
+      } else {
+        console.warn(`[AutoChecker] Groq returned only ${groqResult?.answeredCount ?? 0}/${questionCount} — trying Jimp fallback`);
+      }
     } catch (err) {
       console.warn('[AutoChecker] Groq primary failed, falling back to Jimp:', err.message);
     }
@@ -2562,6 +2677,32 @@ OUTPUT FORMAT: Return ONLY a valid JSON object with question numbers as keys.
 
         console.log(`[AutoChecker] Mixed Groq combined — single call for all ${questionCount} questions (Q${fromQ}-Q${toQ})`);
 
+        // ── FIX: Preprocess and compress image before sending to Groq ───────────
+        let groqBase64 = imageBase64;
+        let groqMime   = mimeType || 'image/jpeg';
+        if (sharp) {
+          try {
+            const buf = Buffer.from(imageBase64, 'base64');
+            const proc = await sharp(buf)
+              .rotate()
+              .resize(1800, 1800, { fit: 'inside', withoutEnlargement: true })
+              .greyscale()
+              .normalize()
+              .modulate({ brightness: 1.08, contrast: 1.15 })
+              .median(3)
+              .sharpen({ sigma: 1.2, m1: 1.0, m2: 0.5 })
+              .jpeg({ quality: 90 })
+              .toBuffer();
+            const origKB = Math.round(imageBase64.length * 0.75 / 1024);
+            const procKB = Math.round(proc.length / 1024);
+            if (proc.length >= 500_000) {
+              groqBase64 = proc.toString('base64');
+              groqMime   = 'image/jpeg';
+              console.log(`[AutoChecker] Mixed Groq image: ${origKB}KB → ${procKB}KB`);
+            }
+          } catch (e) { /* use original */ }
+        }
+
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method:  'POST',
           headers: {
@@ -2575,7 +2716,7 @@ OUTPUT FORMAT: Return ONLY a valid JSON object with question numbers as keys.
               role: 'user',
               content: [
                 { type: 'text',      text: combinedPrompt },
-                { type: 'image_url', image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${imageBase64}` } },
+                { type: 'image_url', image_url: { url: `data:${groqMime};base64,${groqBase64}` } },
               ],
             }],
           }),
