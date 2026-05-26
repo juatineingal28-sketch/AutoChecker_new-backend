@@ -2072,48 +2072,33 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
 
-    bubble_omr: `You are an expert OMR (Optical Mark Recognition) reader analyzing an AutoChecker BUBBLE ANSWER SHEET.
+    bubble_omr: `You are analyzing a PHYSICAL BUBBLE ANSWER SHEET photo. Your job is to identify which bubble the student physically filled with ink.
 
-═══ SHEET LAYOUT ═══
-- Total questions: ${questionCount}
-- Columns: ${questionCount <= 25 ? '1 column (Q1-Q25)' : questionCount <= 50 ? '2 columns (Q1-Q25 left, Q26-Q50 right)' : '3 columns (Q1-Q25 left, Q26-Q50 middle, Q51-Q75 right)'}
-- Each row has 4 circles labeled A B C D (left to right)
-- Question number is to the LEFT of the 4 circles
-- You are reading questions ${qFrom} to ${qTo}
+SHEET INFO: ${questionCount} questions, ${questionCount <= 25 ? '1 column' : questionCount <= 50 ? '2 columns (Q1-Q25 left, Q26-Q50 right)' : '3 columns (Q1-Q25 left, Q26-Q50 middle, Q51-Q75 right)'}.
+Read questions ${qFrom} to ${qTo}.
 
-═══ HOW TO READ BUBBLES — MOST IMPORTANT PART ═══
-The student used a BLACK BALLPEN to fill (shade in) exactly ONE circle per question.
+WHAT YOU'RE LOOKING AT:
+Each question row has 4 printed circles: A  B  C  D
+- The student SHADED one circle solid black with a ballpen
+- Shaded = solid dark ink fills the INSIDE of the circle (looks like a dark disk)
+- Unshaded = just a thin circle outline, white/empty inside
 
-FILLED bubble (= student's answer):
-  • The INTERIOR of the circle is solid black or very dark
-  • Looks like a solid black disc/dot inside the circular outline
-  • The entire inside area is covered with ink
-  • Stands out dramatically from the other 3 empty circles in that row
+THE ANSWERS WILL LOOK RANDOM — this is a real exam. Do NOT generate patterns.
+Wrong approach: "B,C,B,C,B,C..." — this is a hallucination pattern, NOT real data.
+Right approach: examine each row individually, report what you actually see.
 
-EMPTY bubble (= NOT the answer):
-  • Only a thin circular OUTLINE is visible
-  • The INTERIOR is white/light — hollow
-  • Just a ring, not a disc
+FOR EACH QUESTION ROW:
+1. Locate the question number on the left
+2. Find all 4 circles (A, B, C, D) to its right
+3. Compare the INTERIOR darkness of all 4 circles
+4. The one with dark/black FILL inside = the answer
+5. If none appear filled, return ""
 
-KEY: Compare all 4 circles in the same row. The filled one is OBVIOUSLY darker inside. This is not subtle — a filled bubble looks completely different from an empty one.
+IMPORTANT: Real exams typically have a mix of A, B, C, and D answers spread throughout.
+If you find yourself returning only 2 letters alternating (like B,C,B,C), STOP — you are hallucinating. Re-examine every row from scratch.
 
-═══ COLUMN READING GUIDE ═══
-- LEFT column: find Q1 at the top, read down to Q25
-- MIDDLE column (if 50Q+): find Q26 at top, read down to Q50  
-- RIGHT column (if 75Q): find Q51 at top, read down to Q75 — DO NOT skip this column!
-- Each column has its OWN set of question numbers on the left and A B C D bubbles
-
-═══ ANTI-HALLUCINATION RULES ═══
-1. Process each question row INDEPENDENTLY — the previous answer does NOT predict the next
-2. If you find yourself assigning the same letter 5+ times in a row, STOP and re-examine
-3. Real exam answer distributions are roughly equal across A, B, C, D
-4. NEVER assume a pattern. Each row is examined fresh.
-5. A partially marked or crossed-out bubble should still be read as that answer
-
-═══ OUTPUT FORMAT ═══
-Return ONLY a valid JSON object. No text before or after. Example:
-{"${qFrom}":"C","${qFrom+1}":"A","${qFrom+2}":"D",...,"${qTo}":"B"}
-Use "" for unanswered questions. Keys must be question numbers as strings.`,
+Return ONLY valid JSON, no extra text:
+{"${qFrom}":"A","${qFrom+1}":"C",...,"${qTo}":"B"}`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -2349,7 +2334,7 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
           return null;
         }
 
-        // Check 3: exact ABCD cycling pattern covering > 80% of answers (raised from 75%)
+        // Check 3: exact ABCD cycling pattern covering > 80% of answers
         let cycleMatches = 0;
         const cycle = ['A','B','C','D'];
         for (let i = 0; i < vals.length; i++) {
@@ -2358,6 +2343,28 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
         if (cycleMatches / vals.length >= 0.80) {
           console.warn(`[Groq] Hallucination detected — ABCD cycle pattern (${cycleMatches}/${vals.length} match). Rejecting result.`);
           return null;
+        }
+
+        // Check 4: alternating two-letter pattern (e.g. B,C,B,C or A,C,A,C)
+        // Common Groq hallucination — missed by other checks since neither letter
+        // alone dominates 75% and there is no consecutive same-letter streak.
+        const letterPairs = [
+          ['A','B'],['A','C'],['A','D'],
+          ['B','C'],['B','D'],['C','D'],
+        ];
+        for (const [p, q2] of letterPairs) {
+          let altMatches = 0;
+          for (let i = 0; i < vals.length; i++) {
+            if (vals[i] === p || vals[i] === q2) altMatches++;
+          }
+          const pCount  = vals.filter(v => v === p).length;
+          const q2Count = vals.filter(v => v === q2).length;
+          // Fire if >85% of answers are from only these two letters AND both appear often
+          const bothPresent = pCount >= vals.length * 0.20 && q2Count >= vals.length * 0.20;
+          if (altMatches / vals.length >= 0.85 && bothPresent) {
+            console.warn(`[Groq] Hallucination detected — only ${p}+${q2} used (${altMatches}/${vals.length} = ${(altMatches/vals.length*100).toFixed(0)}%). Real exams use all 4 options. Rejecting.`);
+            return null;
+          }
         }
       }
     }
@@ -2463,59 +2470,139 @@ if (isBubble) {
       console.warn('[AutoChecker] Groq attempt 1 failed:', err.message);
     }
 
-    // ── Attempt 2: hallucination caught — retry with original higher-res image ─
-    // When Groq hallucinates (all-D pattern), it usually means the compressed
-    // image lost contrast. Retry using the original uncompressed image — it's
-    // larger but Groq supports up to ~4MB and accuracy is worth it.
+    // ── Attempt 2: hallucination caught — use a ROW-BY-ROW explicit prompt ───
+    // Instead of just retrying the same prompt with a bigger image,
+    // use a DIFFERENT prompting strategy that forces Groq to slow down
+    // and read each row individually before outputting JSON.
     if (groqResult === null) {
-      console.warn('[AutoChecker] Groq hallucination on attempt 1 — retrying with original image');
+      console.warn('[AutoChecker] Groq hallucination on attempt 1 — retrying with row-by-row prompt strategy');
       try {
-        // Use original image (before preprocessing) for the retry
-        const origKB = Math.round(imageBase64.length * 0.75 / 1024);
-        console.log(`[AutoChecker] Retry with original image: ${origKB}KB`);
-        // If original is too large (>3.5MB base64 decoded), resize more carefully
+        const numCols2 = questionCount <= 25 ? 1 : questionCount <= 50 ? 2 : 3;
+        const colDesc  = numCols2 === 1
+          ? 'single column'
+          : numCols2 === 2
+            ? 'TWO columns: left (Q1-Q25) and right (Q26-Q50)'
+            : 'THREE columns: left (Q1-Q25), middle (Q26-Q50), right (Q51-Q75)';
+
+        const rowByRowPrompt = `Look at this bubble answer sheet photo. It has ${colDesc}.
+
+Each row = 1 question. The row shows: [question number]  [circle A]  [circle B]  [circle C]  [circle D]
+
+One circle per row is FILLED (solid black ink inside). The others are EMPTY (hollow outline only).
+
+Go through EVERY row from top to bottom in EVERY column. For each row:
+- Look at which of the 4 circles has dark solid ink INSIDE it (not just an outline)
+- That is the student's answer
+
+The answers will be different for each row. Do NOT repeat the same letter. Do NOT alternate letters. Actually look at each circle.
+
+Output ONLY this JSON (no other text):
+{"1":"?","2":"?","3":"?",..."${questionCount}":"?"}
+
+Replace each ? with A, B, C, or D based on which bubble is physically filled. Use "" if blank.`;
+
+        // Use original image at high resolution for attempt 2
         let retryBase64 = imageBase64;
         let retryMime   = mimeType || 'image/jpeg';
-        if (sharp && imageBase64.length * 0.75 > 3_500_000) {
-          const buf = Buffer.from(imageBase64, 'base64');
-          const resized = await sharp(buf)
-            .resize(2400, 2400, { fit: 'inside', withoutEnlargement: true })
-            .jpeg({ quality: 95 })
-            .toBuffer();
-          retryBase64 = resized.toString('base64');
-          retryMime   = 'image/jpeg';
-          console.log(`[AutoChecker] Retry image resized to ${Math.round(resized.length/1024)}KB`);
+        if (sharp) {
+          try {
+            const buf2 = Buffer.from(imageBase64, 'base64');
+            const resized2 = await sharp(buf2)
+              .rotate()
+              .greyscale()
+              .modulate({ brightness: 1.08, contrast: 1.40 })
+              .normalise()
+              .sharpen({ sigma: 2.0 })
+              .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
+              .jpeg({ quality: 95 })
+              .toBuffer();
+            retryBase64 = resized2.toString('base64');
+            retryMime   = 'image/jpeg';
+            console.log(`[AutoChecker] Attempt 2 image: ${Math.round(resized2.length/1024)}KB (high-contrast)`);
+          } catch (prepErr) {
+            console.warn('[AutoChecker] Attempt 2 prep failed, using original:', prepErr.message);
+          }
         }
-        groqResult = await scanWithGroq(retryBase64, retryMime, 'bubble_omr', questionCount);
+
+        // Call Groq directly with the row-by-row prompt
+        const resp2 = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+            max_tokens: 2048,
+            temperature: 0.1, // lower temperature = less creative, more literal
+            messages: [{ role: 'user', content: [
+              { type: 'text', text: rowByRowPrompt },
+              { type: 'image_url', image_url: { url: `data:${retryMime};base64,${retryBase64}` } },
+            ]}],
+          }),
+        });
+        if (resp2.ok) {
+          const data2   = await resp2.json();
+          const raw2    = (data2.choices?.[0]?.message?.content ?? '').trim();
+          console.log(`[AutoChecker] Attempt 2 raw preview: ${raw2.slice(0, 200)}`);
+          const json2   = raw2.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/,'').trim();
+          let parsed2;
+          try { parsed2 = JSON.parse(json2); } catch { const m = json2.match(/\{[\s\S]*\}/); if (m) parsed2 = JSON.parse(m[0]); }
+          if (parsed2) {
+            const ans2 = {};
+            for (let i = 1; i <= questionCount; i++) {
+              const v = (parsed2[String(i)] ?? '').trim().toUpperCase();
+              ans2[String(i)] = ['A','B','C','D'].includes(v) ? v : '';
+            }
+            const answered2 = Object.values(ans2).filter(a => a !== '').length;
+            // Re-run hallucination check on this result
+            const vals2 = Object.values(ans2).filter(v => v !== '');
+            let isHallucination2 = false;
+            if (vals2.length >= 10) {
+              const freq2 = { A:0,B:0,C:0,D:0 };
+              for (const v of vals2) { if (freq2[v] !== undefined) freq2[v]++; }
+              const maxF2 = Math.max(...Object.values(freq2));
+              if (maxF2 / vals2.length >= 0.75) isHallucination2 = true;
+              if (!isHallucination2) {
+                for (const [p, q2] of [['A','B'],['A','C'],['A','D'],['B','C'],['B','D'],['C','D']]) {
+                  const pC = vals2.filter(v=>v===p).length, q2C = vals2.filter(v=>v===q2).length;
+                  const alt = vals2.filter(v=>v===p||v===q2).length;
+                  if (alt/vals2.length >= 0.85 && pC >= vals2.length*0.20 && q2C >= vals2.length*0.20) {
+                    isHallucination2 = true; break;
+                  }
+                }
+              }
+            }
+            if (!isHallucination2 && answered2 >= Math.ceil(questionCount * 0.50)) {
+              groqResult = { studentName: null, answers: ans2, answeredCount: answered2, engineConfidence: 85, confidence: 0.85 };
+              console.log(`[AutoChecker] Attempt 2 (row-by-row) SUCCESS — ${answered2}/${questionCount} ✓`);
+            } else {
+              console.warn(`[AutoChecker] Attempt 2 also hallucinating or low count (${answered2}) — continuing to attempt 3`);
+            }
+          }
+        }
       } catch (err2) {
         console.warn('[AutoChecker] Groq attempt 2 failed:', err2.message);
       }
     }
 
-    // ── Attempt 3: crop just the bubble grid and send that ────────────────────
-    // If full sheet still hallucinates, crop out the header/footer and send only
-    // the bubble grid area. This removes noise that confuses the model.
+    // ── Attempt 3: crop the bubble grid only, send at maximum resolution ──────
     if (groqResult === null && sharp) {
-      console.warn('[AutoChecker] Groq still failing — retrying with bubble-grid crop');
+      console.warn('[AutoChecker] Groq still failing — retrying with bubble-grid crop (attempt 3)');
       try {
         const buf = Buffer.from(imageBase64, 'base64');
         const meta = await sharp(buf).metadata();
         const iW = meta.width || 1500, iH = meta.height || 2000;
-        // FIX: Use consistent crop fractions regardless of question count
-        // Header is ~17% of page height on all AutoChecker sheets; footer ~5%
         const cropTop    = Math.round(iH * 0.17);
         const cropHeight = Math.round(iH * 0.78);
-        const cropMaxDim = questionCount > 50 ? 2000 : 1800; // larger for 3-col sheets
+        const cropMaxDim = questionCount > 50 ? 2000 : 1800;
         const cropped = await sharp(buf)
           .extract({ left: 0, top: cropTop, width: iW, height: cropHeight })
           .resize(cropMaxDim, cropMaxDim, { fit: 'inside', withoutEnlargement: true })
           .normalize()
-          .modulate({ brightness: 1.10, contrast: 1.25 })
-          .sharpen({ sigma: 1.5 })
-          .jpeg({ quality: 93 })
+          .modulate({ brightness: 1.08, contrast: 1.35 })
+          .sharpen({ sigma: 1.8 })
+          .jpeg({ quality: 94 })
           .toBuffer();
         const cropKB = Math.round(cropped.length / 1024);
-        console.log(`[AutoChecker] Grid crop: ${cropKB}KB (${questionCount}Q, cropMaxDim=${cropMaxDim})`);
+        console.log(`[AutoChecker] Grid crop: ${cropKB}KB (${questionCount}Q)`);
         groqResult = await scanWithGroq(cropped.toString('base64'), 'image/jpeg', 'bubble_omr', questionCount);
       } catch (err3) {
         console.warn('[AutoChecker] Groq attempt 3 (crop) failed:', err3.message);
