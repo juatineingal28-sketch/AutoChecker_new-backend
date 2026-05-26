@@ -2238,14 +2238,22 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
       },
       body: JSON.stringify({
         model:      'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens: 2048,  // FIX: 1000 was too low for 75Q+ sheets (75 answers ≈ 800 tokens min)
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text',      text: prompt },
-            { type: 'image_url', image_url: { url: `data:${groqMimeType};base64,${groqImageBase64}` } },
-          ],
-        }],
+        max_tokens: 2048,
+        temperature: 0.05, // near-zero for maximum literal accuracy
+        messages: [
+          {
+            // FIX v10: system role forces JSON-only output — stops "## Step 1..." thinking text
+            role: 'system',
+            content: 'You are a precise OCR tool for bubble answer sheets. Output ONLY a valid JSON object. No markdown. No explanations. No step-by-step reasoning. No headers. Start your response with { and end with }.'
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'text',      text: prompt },
+              { type: 'image_url', image_url: { url: `data:${groqMimeType};base64,${groqImageBase64}` } },
+            ],
+          }
+        ],
       }),
     });
 
@@ -2256,13 +2264,26 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
 
     const data    = await response.json();
     const rawText = data.choices?.[0]?.message?.content?.trim() ?? '';
-    console.log(`[Groq] Raw response preview: ${rawText.slice(0, 200)}`);
+    console.log(`[Groq] Raw response preview: ${rawText.slice(0, 300)}`);
 
-    const jsonText = rawText
+    // FIX v10: Multi-strategy JSON extraction — handles markdown, thinking text, etc.
+    let jsonText = rawText
       .replace(/^```json\s*/i, '')
       .replace(/^```\s*/i,    '')
       .replace(/\s*```$/,      '')
       .trim();
+
+    // If direct strip didn't work, find the JSON object within the text
+    if (!jsonText.startsWith('{')) {
+      const allMatches = [...rawText.matchAll(/\{[^{}]*\}/g)];
+      if (allMatches.length > 0) {
+        const biggest = allMatches.reduce((a, b) => a[0].length > b[0].length ? a : b);
+        jsonText = biggest[0];
+      } else {
+        const m = rawText.match(/\{[\s\S]*\}/);
+        if (m) jsonText = m[0];
+      }
+    }
 
     let parsed;
     try {
@@ -2306,69 +2327,62 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
     const answeredCount = Object.values(answers).filter(a => a !== '').length;
     const fillRate      = rangeSize > 0 ? answeredCount / rangeSize : 0;
 
-    // ── Hallucination detection — reject repetitive/patterned results ─────────
-    // Groq frequently hallucinates on bubble sheets by returning the same letter
-    // repeated many times or a simple cycling pattern (A,B,C,D,A,B,C,D...).
-    // These are statistically impossible on real exams — reject and return null.
+    // ── Hallucination detection v10 — only reject OBVIOUS machine-generated patterns ──
+    // LESSON FROM LOGS: real 50Q exams CAN have highly skewed distributions.
+    // e.g. an answer key with mostly A/B answers → 25/25 A+B is VALID data.
+    // The old checks rejected real results and forced worse fallback attempts.
+    // New strategy: only reject patterns mechanically impossible on real exams.
     if (examType === 'bubble_omr' || examType === 'bubble_mc' || examType === 'omr') {
       const vals = Object.values(answers).filter(v => v !== '');
-      if (vals.length >= 10) {
-        // Check 1: any single letter dominates ≥ 75% of answers (raised from 60%)
-        // 60% was too aggressive — a skewed-but-valid exam could have 12/20 same letter
+      if (vals.length >= 15) {
         const freq = { A: 0, B: 0, C: 0, D: 0 };
         for (const v of vals) { if (freq[v] !== undefined) freq[v]++; }
         const maxFreq = Math.max(...Object.values(freq));
-        if (maxFreq / vals.length >= 0.75) {
+        const uniqueLetters = Object.values(freq).filter(c => c > 0).length;
+
+        // Check 1: single letter ≥ 90% of ALL answers — truly impossible (raised from 75%)
+        if (maxFreq / vals.length >= 0.90) {
           const dominantLetter = Object.entries(freq).find(([, c]) => c === maxFreq)?.[0];
-          console.warn(`[Groq] Hallucination detected — "${dominantLetter}" appears ${maxFreq}/${vals.length} times (${(maxFreq/vals.length*100).toFixed(0)}%). Rejecting result.`);
+          console.warn(`[Groq] Hallucination — "${dominantLetter}" ${maxFreq}/${vals.length} (${(maxFreq/vals.length*100).toFixed(0)}%). Rejecting.`);
           return null;
         }
 
-        // Check 2: longest consecutive same-letter streak ≥ 9 (raised from 7)
+        // Check 2: consecutive streak ≥ 15 same letter (was 9 — too low)
         let maxStreak = 1, streak = 1;
         for (let i = 1; i < vals.length; i++) {
           if (vals[i] === vals[i - 1]) { streak++; maxStreak = Math.max(maxStreak, streak); }
           else streak = 1;
         }
-        if (maxStreak >= 9) {
-          console.warn(`[Groq] Hallucination detected — streak of ${maxStreak} consecutive same-letter answers. Rejecting result.`);
+        if (maxStreak >= 15) {
+          console.warn(`[Groq] Hallucination — streak of ${maxStreak} identical consecutive answers. Rejecting.`);
           return null;
         }
 
-        // Check 3: exact ABCD cycling pattern covering > 80% of answers
+        // Check 3: exact ABCD cycling ≥ 85% (mathematical, not real)
         let cycleMatches = 0;
         const cycle = ['A','B','C','D'];
         for (let i = 0; i < vals.length; i++) {
           if (vals[i] === cycle[i % 4]) cycleMatches++;
         }
-        if (cycleMatches / vals.length >= 0.80) {
-          console.warn(`[Groq] Hallucination detected — ABCD cycle pattern (${cycleMatches}/${vals.length} match). Rejecting result.`);
+        if (cycleMatches / vals.length >= 0.85) {
+          console.warn(`[Groq] Hallucination — ABCD cycle pattern ${cycleMatches}/${vals.length}. Rejecting.`);
           return null;
         }
 
-        // Check 4: alternating two-letter pattern (e.g. B,C,B,C or A,C,A,C)
-        // Common Groq hallucination — missed by other checks since neither letter
-        // alone dominates 75% and there is no consecutive same-letter streak.
-        const letterPairs = [
-          ['A','B'],['A','C'],['A','D'],
-          ['B','C'],['B','D'],['C','D'],
-        ];
-        for (const [p, q2] of letterPairs) {
-          let altMatches = 0;
-          for (let i = 0; i < vals.length; i++) {
-            if (vals[i] === p || vals[i] === q2) altMatches++;
+        // Check 4: only 2 unique letters AND strict perfect alternating pattern
+        // (removed the broad "2-letter 92%" check — real exams can have skewed keys)
+        if (uniqueLetters <= 2 && vals.length >= 20) {
+          let altCount = 0;
+          for (let i = 1; i < vals.length; i++) {
+            if (vals[i] !== vals[i-1]) altCount++;
           }
-          const pCount  = vals.filter(v => v === p).length;
-          const q2Count = vals.filter(v => v === q2).length;
-          // Fire if >92% of answers are from only these two letters AND both appear often
-          // FIX v9.5: raised from 85% → 92%. Short exams (25-30Q) can legitimately have
-          // only 2-3 options appear. 85% was falsely rejecting valid results.
-          const bothPresent = pCount >= vals.length * 0.25 && q2Count >= vals.length * 0.25;
-          if (altMatches / vals.length >= 0.92 && bothPresent) {
-            console.warn(`[Groq] Hallucination detected — only ${p}+${q2} used (${altMatches}/${vals.length} = ${(altMatches/vals.length*100).toFixed(0)}%). Real exams use all 4 options. Rejecting.`);
+          if (altCount >= vals.length * 0.92) {
+            console.warn(`[Groq] Hallucination — perfect alternating 2-letter pattern. Rejecting.`);
             return null;
           }
         }
+
+        console.log(`[Groq] Distribution OK — A=${freq.A} B=${freq.B} C=${freq.C} D=${freq.D}, streak=${maxStreak}`);
       }
     }
 
@@ -2546,57 +2560,84 @@ Output ONLY this JSON (replace ? with A/B/C/D or "" for blank):
         }
 
         // Call Groq directly with the row-by-row prompt
+        // FIX v10: Add system role to force JSON-only output — prevents "## Step 1..." thinking
         const resp2 = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: 'meta-llama/llama-4-scout-17b-16e-instruct',
             max_tokens: 2048,
-            temperature: 0.1, // lower temperature = less creative, more literal
-            messages: [{ role: 'user', content: [
-              { type: 'text', text: rowByRowPrompt },
-              { type: 'image_url', image_url: { url: `data:${retryMime};base64,${retryBase64}` } },
-            ]}],
+            temperature: 0.05, // near-zero — as literal and deterministic as possible
+            messages: [
+              {
+                role: 'system',
+                content: 'You are a precise OCR tool. You output ONLY valid JSON objects. No markdown. No explanations. No step-by-step reasoning. No "## Step" headers. ONLY the raw JSON object starting with { and ending with }.'
+              },
+              { role: 'user', content: [
+                { type: 'text', text: rowByRowPrompt },
+                { type: 'image_url', image_url: { url: `data:${retryMime};base64,${retryBase64}` } },
+              ]}
+            ],
           }),
         });
         if (resp2.ok) {
           const data2   = await resp2.json();
           const raw2    = (data2.choices?.[0]?.message?.content ?? '').trim();
-          console.log(`[AutoChecker] Attempt 2 raw preview: ${raw2.slice(0, 200)}`);
-          const json2   = raw2.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/,'').trim();
-          let parsed2;
-          try { parsed2 = JSON.parse(json2); } catch { const m = json2.match(/\{[\s\S]*\}/); if (m) parsed2 = JSON.parse(m[0]); }
+          console.log(`[AutoChecker] Attempt 2 raw preview: ${raw2.slice(0, 300)}`);
+
+          // FIX v10: More aggressive JSON extraction — handles markdown, thinking text, etc.
+          let parsed2 = null;
+          try {
+            // Try 1: direct parse after stripping markdown fences
+            const stripped = raw2.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/,'').trim();
+            parsed2 = JSON.parse(stripped);
+          } catch {
+            // Try 2: extract the LAST JSON object found (after any thinking text)
+            const allMatches = [...raw2.matchAll(/\{[^{}]*\}/g)];
+            if (allMatches.length > 0) {
+              // Take the largest match (most answers)
+              const biggest = allMatches.reduce((a, b) => a[0].length > b[0].length ? a : b);
+              try { parsed2 = JSON.parse(biggest[0]); } catch {}
+            }
+            if (!parsed2) {
+              // Try 3: greedy match including nested braces
+              const m = raw2.match(/\{[\s\S]*\}/);
+              if (m) try { parsed2 = JSON.parse(m[0]); } catch {}
+            }
+          }
+
           if (parsed2) {
             const ans2 = {};
             for (let i = 1; i <= questionCount; i++) {
-              const v = (parsed2[String(i)] ?? '').trim().toUpperCase();
+              const v = (parsed2[String(i)] ?? parsed2[i] ?? '').toString().trim().toUpperCase();
               ans2[String(i)] = ['A','B','C','D'].includes(v) ? v : '';
             }
             const answered2 = Object.values(ans2).filter(a => a !== '').length;
-            // Re-run hallucination check on this result
+            // Re-run hallucination check — same relaxed v10 rules
             const vals2 = Object.values(ans2).filter(v => v !== '');
             let isHallucination2 = false;
-            if (vals2.length >= 10) {
+            if (vals2.length >= 15) {
               const freq2 = { A:0,B:0,C:0,D:0 };
               for (const v of vals2) { if (freq2[v] !== undefined) freq2[v]++; }
               const maxF2 = Math.max(...Object.values(freq2));
-              if (maxF2 / vals2.length >= 0.75) isHallucination2 = true;
+              if (maxF2 / vals2.length >= 0.90) isHallucination2 = true;
               if (!isHallucination2) {
-                for (const [p, q2] of [['A','B'],['A','C'],['A','D'],['B','C'],['B','D'],['C','D']]) {
-                  const pC = vals2.filter(v=>v===p).length, q2C = vals2.filter(v=>v===q2).length;
-                  const alt = vals2.filter(v=>v===p||v===q2).length;
-                  if (alt/vals2.length >= 0.85 && pC >= vals2.length*0.20 && q2C >= vals2.length*0.20) {
-                    isHallucination2 = true; break;
-                  }
+                let maxSt2 = 1, st2 = 1;
+                for (let i = 1; i < vals2.length; i++) {
+                  st2 = vals2[i] === vals2[i-1] ? st2+1 : 1;
+                  maxSt2 = Math.max(maxSt2, st2);
                 }
+                if (maxSt2 >= 15) isHallucination2 = true;
               }
             }
-            if (!isHallucination2 && answered2 >= Math.ceil(questionCount * 0.50)) {
+            if (!isHallucination2 && answered2 >= Math.ceil(questionCount * 0.40)) {
               groqResult = { studentName: null, answers: ans2, answeredCount: answered2, engineConfidence: 85, confidence: 0.85 };
               console.log(`[AutoChecker] Attempt 2 (row-by-row) SUCCESS — ${answered2}/${questionCount} ✓`);
             } else {
-              console.warn(`[AutoChecker] Attempt 2 also hallucinating or low count (${answered2}) — continuing to attempt 3`);
+              console.warn(`[AutoChecker] Attempt 2 hallucinating or low count (${answered2}) — continuing to attempt 3`);
             }
+          } else {
+            console.warn('[AutoChecker] Attempt 2 — could not extract valid JSON from response');
           }
         }
       } catch (err2) {
@@ -2708,29 +2749,14 @@ Output ONLY this JSON (replace ? with A/B/C/D or "" for blank):
     if (groqResult && groqResult.answeredCount >= Math.ceil(questionCount * 0.50)) {
       console.log(`[AutoChecker] Groq AI vision PRIMARY — ${groqResult.answeredCount}/${questionCount} bubbles ✓`);
 
-      // Cross-check any blanks Groq left with Jimp
-      // IMPORTANT: Only fill blanks where Jimp has HIGH confidence (fill > 35%)
-      // Low-confidence Jimp answers are often wrong due to grid drift
+      // FIX v10: Jimp cross-check DISABLED for blank-filling.
+      // Jimp pixel detector uses hardcoded grid constants that may not match the
+      // actual printed sheet — it was filling Groq's blanks with WRONG answers.
+      // Better to leave blanks as "" than fill them incorrectly.
+      // Jimp is still used as full fallback when Groq is completely unavailable.
       const blankCount = Object.values(groqResult.answers).filter(a => !a).length;
-      if (blankCount > 0 && blankCount <= Math.ceil(questionCount * 0.30)) {
-        console.log(`[AutoChecker] Groq left ${blankCount} blanks — attempting Jimp cross-check`);
-        try {
-          const jimpFill = await detectBubblesWithJimp(processedBase64, processedMime, questionCount);
-          if (jimpFill) {
-            let filled = 0;
-            for (const [q, ans] of Object.entries(groqResult.answers)) {
-              // Only fill if Groq left it blank AND Jimp has an answer with decent confidence
-              if (!ans && jimpFill.answers[q] && jimpFill.answers[q] !== '') {
-                groqResult.answers[q] = jimpFill.answers[q];
-                filled++;
-              }
-            }
-            if (filled > 0) {
-              groqResult.answeredCount += filled;
-              console.log(`[AutoChecker] Jimp cross-check filled ${filled} blank(s) from Groq`);
-            }
-          }
-        } catch (jErr) { console.warn('[AutoChecker] Jimp cross-check failed:', jErr.message); }
+      if (blankCount > 0) {
+        console.log(`[AutoChecker] Groq left ${blankCount} blank(s) — keeping as blank (Jimp cross-check disabled to avoid wrong fills)`);
       }
       return groqResult;
     }
@@ -3758,7 +3784,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'groq-primary / jimp-fallback',
-  version: '9.5-improved-groq-prompts-hallucination-fix-layout-recal',
+  version: 'v10.0-hallucination-fix-system-role-json-extraction',
 }));
 
 // ─── OMR Calibration endpoint — fine-tune layout constants per sheet ──────────
@@ -3816,4 +3842,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v95-improved-groq-prompts-hallucination-fix-3col-layout
+// redeploy-trigger-20260526-v100-system-role-hallucination-fix-json-extraction
