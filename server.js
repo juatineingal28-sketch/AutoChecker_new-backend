@@ -1295,29 +1295,30 @@ const OMR_LAYOUT = {
     BUBBLE_STEP: 0.1020,
   },
   // 3-column layout (51–100 questions)
-  // RECALIBRATED v8.0 — re-measured from actual student's 75Q AutoChecker sheet photo.
+  // RECALIBRATED v9.3 — re-measured from actual student 75Q AutoChecker sheet photo.
   //
-  // Physical sheet photo (~930×1240px) → warped to 794×1123 canonical.
-  // Bubble centre X positions measured directly from the sheet image:
-  //   Col0: A=111  B=151  C=191  D=231  px  (step=40px)
-  //   Col1: A=359  B=399  C=439  D=479  px
-  //   Col2: A=606  B=646  C=686  D=726  px
-  //   First row cy ≈ 179px, row spacing ≈ 25px
+  // Measured from photo (image is ~930px wide photo of A4 sheet):
+  //   After homography warp to 794×1123px:
+  //   Col0 (Q1-Q25):  A≈111  B≈151  C≈191  D≈231  step≈40px
+  //   Col1 (Q26-Q50): A≈359  B≈399  C≈439  D≈479
+  //   Col2 (Q51-Q75): A≈607  B≈647  C≈687  D≈727
+  //   First row cy ≈ 217px (matching 2-col GRID_TOP), row spacing ≈ 34.8px
   //
+  //   GRID_TOP  = 217/1123 = 0.1932  (same as 2-col — same header height)
+  //   ROW_STEP  = 34.8/1123 = 0.0310  (25 rows fit in same grid height as 2-col)
   //   Q_NUM_W   = 111/794 = 0.1398
   //   BUBBLE_STEP = 40/794 = 0.0504
-  //   COL_LEFT[1] = (359-111)/794 = 0.3123
-  //   COL_LEFT[2] = (606-111)/794 = 0.6234
-  //   GRID_TOP  = 179/1123 = 0.1594
-  //   ROW_STEP  = 25/1123  = 0.0223
+  //   COL_LEFT[1] = (359-111)/794 = 0.3123  (offset from col0 bubbleX0)
+  //   COL_LEFT[2] = (607-111)/794 = 0.6247
   //
-  // Previous constants (Q_NUM_W=0.1234, step=0.0542) were shifted left by ~13px,
-  // causing all answers to read one letter off (A→B, B→C, etc.).
+  // IMPORTANT: ROW_STEP for 75Q is same as 50Q (0.0310) because the grid area
+  // is the same height and 25 rows in each column. Previous 0.0223 was wrong —
+  // it assumed rows were SHORTER, causing cumulative drift by Q13+.
   3: {
-    GRID_TOP:    0.1594,
-    ROW_STEP:    0.0223,
-    BUBBLE_R:    0.0126,
-    COL_LEFT:    [0.0000, 0.3123, 0.6234],
+    GRID_TOP:    0.1932,  // FIX v9.3: was 0.1594 — now matches 2-col (same header)
+    ROW_STEP:    0.0310,  // FIX v9.3: was 0.0223 — 25 rows, same row height as 2-col
+    BUBBLE_R:    0.0113,  // same bubble radius as 2-col
+    COL_LEFT:    [0.0000, 0.3123, 0.6247],
     Q_NUM_W:     0.1398,
     BUBBLE_STEP: 0.0504,
   },
@@ -2073,9 +2074,14 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
     bubble_omr: `This is an AutoChecker BUBBLE SHEET (OMR) exam. You must carefully identify which bubble is PHYSICALLY FILLED IN for each question.
 
 LAYOUT — READ THIS CAREFULLY:
-- The sheet has columns of questions (e.g. 2 columns: Q1-Q25 on the LEFT, Q26-Q50 on the RIGHT; or 3 columns for 75Q).
+- The sheet has columns of questions based on total question count:
+  • 25Q: 1 column (Q1-Q25 on LEFT)
+  • 50Q: 2 columns (Q1-Q25 LEFT, Q26-Q50 RIGHT)
+  • 75Q: 3 columns (Q1-Q25 LEFT, Q26-Q50 MIDDLE, Q51-Q75 RIGHT)
+  • 100Q: 3 columns (Q1-Q34 LEFT, Q35-Q67 MIDDLE, Q68-Q100 RIGHT)
 - Each question row shows 4 circles/ovals in order: A  B  C  D  (left to right).
 - The question number appears to the LEFT of the 4 bubbles.
+- CRITICAL FOR 75Q/100Q: You MUST read ALL THREE columns. Do NOT stop after Q50. The third column (rightmost) contains Q51-Q75. Look at the far-right section of the sheet.
 
 HOW TO IDENTIFY A FILLED BUBBLE:
 ✅ FILLED = the inside of the circle is DARK (solid black, dark gray, or heavily shaded).
@@ -2098,9 +2104,10 @@ CRITICAL — DO NOT ASSUME PATTERNS:
 APPROACH: Go row by row. For each row, inspect all 4 circles. The filled one has a clearly DARKER INTERIOR. Compare all 4 in the row — pick the darkest interior.
 
 MULTI-COLUMN SHEETS:
-- LEFT column: Q1 at top going DOWN to Q25 (or Q50 for 1-col sheets).
-- RIGHT column: continues from Q26 downward (or Q51 for 3-col sheets).
-- Read ALL columns. Do not stop at Q25.
+- LEFT column: Q1 at top going DOWN to Q25.
+- MIDDLE column (if present): continues from Q26 downward to Q50.
+- RIGHT column (if present for 75Q): Q51 at top going DOWN to Q75. DO NOT skip this column.
+- Read ALL columns completely. Do not stop early.
 
 Return ONLY the letter (A, B, C, or D) of the bubble whose interior is clearly filled/shaded.
 If NO bubble interior is visibly darker than the others in that row, return "".
@@ -2187,7 +2194,9 @@ If blank (student did not write anything), return "".`,
   const prompt = `You are an expert at reading Filipino school exam papers with handwritten student answers.
 
 EXAM TYPE: ${examType}
+TOTAL QUESTIONS ON THIS SHEET: ${questionCount}
 YOUR JOB: Read ONLY ${rangeDesc} (numbered ${qFrom} to ${qTo}).
+${questionCount > 50 ? `\nIMPORTANT: This is a ${questionCount}-question sheet with 3 columns. You MUST read the RIGHTMOST column (Q51–Q${questionCount}). Do NOT stop at Q50.\n` : ''}
 
 ${instructions}
 
@@ -2217,15 +2226,17 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
     if (sharp) {
       try {
         const inputBuf = Buffer.from(imageBase64, 'base64');
+        // FIX: Use higher resolution for 75Q+ (3-column sheets need more pixels per bubble)
+        const maxDim = questionCount > 50 ? 2000 : 1600;
         const compressed = await sharp(inputBuf)
-          .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: 85 })
+          .resize(maxDim, maxDim, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 88 })
           .toBuffer();
         groqImageBase64 = compressed.toString('base64');
         groqMimeType    = 'image/jpeg';
         const origKB = Math.round(imageBase64.length * 0.75 / 1024);
         const compKB = Math.round(compressed.length / 1024);
-        console.log(`[Groq] Image compressed: ${origKB}KB → ${compKB}KB`);
+        console.log(`[Groq] Image compressed: ${origKB}KB → ${compKB}KB (maxDim=${maxDim})`);
       } catch (compErr) {
         console.warn('[Groq] Image compression failed, using original:', compErr.message);
       }
@@ -2239,7 +2250,7 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
       },
       body: JSON.stringify({
         model:      'meta-llama/llama-4-scout-17b-16e-instruct',
-        max_tokens: 1000,
+        max_tokens: 2048,  // FIX: 1000 was too low for 75Q+ sheets (75 answers ≈ 800 tokens min)
         messages: [{
           role: 'user',
           content: [
@@ -2306,6 +2317,48 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
     const rangeSize     = qTo - qFrom + 1;
     const answeredCount = Object.values(answers).filter(a => a !== '').length;
     const fillRate      = rangeSize > 0 ? answeredCount / rangeSize : 0;
+
+    // ── Hallucination detection — reject repetitive/patterned results ─────────
+    // Groq frequently hallucinates on bubble sheets by returning the same letter
+    // repeated many times or a simple cycling pattern (A,B,C,D,A,B,C,D...).
+    // These are statistically impossible on real exams — reject and return null.
+    if (examType === 'bubble_omr' || examType === 'bubble_mc' || examType === 'omr') {
+      const vals = Object.values(answers).filter(v => v !== '');
+      if (vals.length >= 10) {
+        // Check 1: any single letter dominates ≥ 60% of answers
+        const freq = { A: 0, B: 0, C: 0, D: 0 };
+        for (const v of vals) { if (freq[v] !== undefined) freq[v]++; }
+        const maxFreq = Math.max(...Object.values(freq));
+        if (maxFreq / vals.length >= 0.60) {
+          const dominantLetter = Object.entries(freq).find(([, c]) => c === maxFreq)?.[0];
+          console.warn(`[Groq] Hallucination detected — "${dominantLetter}" appears ${maxFreq}/${vals.length} times (${(maxFreq/vals.length*100).toFixed(0)}%). Rejecting result.`);
+          return null;
+        }
+
+        // Check 2: longest consecutive same-letter streak ≥ 7
+        let maxStreak = 1, streak = 1;
+        for (let i = 1; i < vals.length; i++) {
+          if (vals[i] === vals[i - 1]) { streak++; maxStreak = Math.max(maxStreak, streak); }
+          else streak = 1;
+        }
+        if (maxStreak >= 7) {
+          console.warn(`[Groq] Hallucination detected — streak of ${maxStreak} consecutive same-letter answers. Rejecting result.`);
+          return null;
+        }
+
+        // Check 3: exact ABCD cycling pattern covering > 50% of answers
+        let cycleMatches = 0;
+        const cycle = ['A','B','C','D'];
+        for (let i = 0; i < vals.length; i++) {
+          if (vals[i] === cycle[i % 4]) cycleMatches++;
+        }
+        if (cycleMatches / vals.length >= 0.75) {
+          console.warn(`[Groq] Hallucination detected — ABCD cycle pattern (${cycleMatches}/${vals.length} match). Rejecting result.`);
+          return null;
+        }
+      }
+    }
+
     const confidence    = Math.min(0.82 + fillRate * 0.15, 0.97);
 
     console.log(`[Groq] Done — answered: ${answeredCount}/${rangeSize} (Q${qFrom}-Q${qTo}), confidence: ${(confidence * 100).toFixed(1)}%`);
@@ -2443,19 +2496,21 @@ if (isBubble) {
         const buf = Buffer.from(imageBase64, 'base64');
         const meta = await sharp(buf).metadata();
         const iW = meta.width || 1500, iH = meta.height || 2000;
-        // Crop: skip top 18% (header) and bottom 5% (footer), keep full width
-        const cropTop    = Math.round(iH * 0.18);
-        const cropHeight = Math.round(iH * 0.77);
+        // FIX: Use consistent crop fractions regardless of question count
+        // Header is ~17% of page height on all AutoChecker sheets; footer ~5%
+        const cropTop    = Math.round(iH * 0.17);
+        const cropHeight = Math.round(iH * 0.78);
+        const cropMaxDim = questionCount > 50 ? 2000 : 1800; // larger for 3-col sheets
         const cropped = await sharp(buf)
           .extract({ left: 0, top: cropTop, width: iW, height: cropHeight })
-          .resize(1800, 1800, { fit: 'inside', withoutEnlargement: true })
+          .resize(cropMaxDim, cropMaxDim, { fit: 'inside', withoutEnlargement: true })
           .normalize()
           .modulate({ brightness: 1.10, contrast: 1.25 })
           .sharpen({ sigma: 1.5 })
           .jpeg({ quality: 93 })
           .toBuffer();
         const cropKB = Math.round(cropped.length / 1024);
-        console.log(`[AutoChecker] Grid crop: ${cropKB}KB`);
+        console.log(`[AutoChecker] Grid crop: ${cropKB}KB (${questionCount}Q, cropMaxDim=${cropMaxDim})`);
         groqResult = await scanWithGroq(cropped.toString('base64'), 'image/jpeg', 'bubble_omr', questionCount);
       } catch (err3) {
         console.warn('[AutoChecker] Groq attempt 3 (crop) failed:', err3.message);
@@ -2653,7 +2708,7 @@ OUTPUT FORMAT: Return ONLY a valid JSON object with question numbers as keys.
           },
           body: JSON.stringify({
             model:      'meta-llama/llama-4-scout-17b-16e-instruct',
-            max_tokens: 1000,
+            max_tokens: 2048,  // FIX: was 1000, too low for 75Q+ sheets
             messages: [{
               role: 'user',
               content: [
@@ -3509,7 +3564,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '8.4-scan-bubbles-local-processor',
+  version: '8.5-75Q-groq-hallucination-fix',
 }));
 
 // Error handler
@@ -3531,4 +3586,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v84-scan-bubbles-local-processorS
+// redeploy-trigger-20260526-v85-75Q-fix-groq-hallucination-jimp-recal
