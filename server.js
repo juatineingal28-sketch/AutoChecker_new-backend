@@ -2382,15 +2382,25 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
         }
 
         // Check 4: suspiciously even distribution AND low streak (dead giveaway of cycling)
-        // Real exams: some letters appear more than others (std dev > 10% of count)
-        // Cycling pattern: near-perfectly even (A=12 B=13 C=13 D=12 for 50Q)
-        // Combined with streak=1 (perfect alternation) → definitely hallucinated
         const avgFreq = vals.length / 4;
         const freqStd = Math.sqrt(Object.values(freq).reduce((s, f) => s + (f - avgFreq)**2, 0) / 4);
-        const isVeryEven = freqStd < avgFreq * 0.15; // all letters within 15% of average
+        const isVeryEven = freqStd < avgFreq * 0.15;
         const isPerfectlyAlternating = maxStreak === 1;
         if (isVeryEven && isPerfectlyAlternating && vals.length >= 20) {
-          console.warn(`[Groq] Hallucination — suspiciously even distribution (std=${freqStd.toFixed(1)}) with no consecutive repeats. Rejecting.`);
+          console.warn(`[Groq] Hallucination — even distribution (std=${freqStd.toFixed(1)}) with no repeats. Rejecting.`);
+          return null;
+        }
+
+        // Check 5: two-letter dominance — e.g. B=23 C=20 A=2 D=5 (86% B+C)
+        // Real exams always use all 4 choices. If 2 letters cover ≥75% AND the other
+        // 2 together are <15%, it's a hallucination (model is just alternating 2 letters).
+        // FIX v10.3: catches the B/C alternating pattern seen in Attempt 3 logs.
+        const sortedFreqs = Object.values(freq).sort((a, b) => b - a);
+        const top2Frac = (sortedFreqs[0] + sortedFreqs[1]) / vals.length;
+        const bot2Frac = (sortedFreqs[2] + sortedFreqs[3]) / vals.length;
+        if (top2Frac >= 0.80 && bot2Frac <= 0.20 && vals.length >= 15) {
+          const top2Letters = Object.entries(freq).sort((a,b) => b[1]-a[1]).slice(0,2).map(e=>e[0]).join('+');
+          console.warn(`[Groq] Hallucination — two-letter dominance ${top2Letters} = ${(top2Frac*100).toFixed(0)}%. Rejecting.`);
           return null;
         }
 
@@ -2572,17 +2582,27 @@ Output ONLY this JSON (replace ? with A/B/C/D or "" for blank):
         }
 
         // Call Groq directly with the row-by-row prompt
+        // FIX v10.3: Added system role to suppress chain-of-thought output.
+        // llama-4-scout was outputting "## Step 1: Scanning..." before the JSON,
+        // causing the JSON parser to fail. System role forces pure JSON output.
+        // Temperature set to 0 for fully deterministic scanning (no creativity).
         const resp2 = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: 'meta-llama/llama-4-scout-17b-16e-instruct',
             max_tokens: 2048,
-            temperature: 0.1, // lower temperature = less creative, more literal
-            messages: [{ role: 'user', content: [
-              { type: 'text', text: rowByRowPrompt },
-              { type: 'image_url', image_url: { url: `data:${retryMime};base64,${retryBase64}` } },
-            ]}],
+            temperature: 0,
+            messages: [
+              {
+                role: 'system',
+                content: 'You are a bubble sheet scanner. Output ONLY a valid JSON object. No markdown. No steps. No explanations. No "##". Start with { and end with }.',
+              },
+              { role: 'user', content: [
+                { type: 'text', text: rowByRowPrompt },
+                { type: 'image_url', image_url: { url: `data:${retryMime};base64,${retryBase64}` } },
+              ]},
+            ],
           }),
         });
         if (resp2.ok) {
@@ -2724,6 +2744,71 @@ Output ONLY this JSON (replace ? with A/B/C/D or "" for blank):
         }
       } catch (err4) {
         console.warn('[AutoChecker] Per-column Groq attempt failed:', err4.message);
+      }
+    }
+
+    // ── Attempt 4: per-column scan for 26–50Q sheets ─────────────────────────
+    // When full-sheet scan keeps hallucinating, split left col (Q1-25) and right
+    // col (Q26-50) and scan each as a separate narrow image.
+    // Each crop is ~half the width → Groq sees fewer bubbles per call → more accurate.
+    // FIX v10.3: Previously only done for 75Q+. Now also done for 26-50Q sheets
+    // since the B/C alternating hallucination is caused by too many bubbles in frame.
+    if (groqResult === null && sharp && questionCount > 25 && questionCount <= 50) {
+      console.warn('[AutoChecker] Groq still failing for 50Q — retrying per-column (2 crops)');
+      try {
+        const buf = Buffer.from(imageBase64, 'base64');
+        const meta = await sharp(buf).metadata();
+        const iW = meta.width || 1500, iH = meta.height || 2000;
+        const cropTop    = Math.round(iH * 0.17);
+        const cropHeight = Math.round(iH * 0.78);
+
+        const colRanges50 = [
+          { from: 1,  to: 25,           leftFrac: 0.00, widthFrac: 0.50 },
+          { from: 26, to: questionCount, leftFrac: 0.48, widthFrac: 0.52 },
+        ];
+
+        const combinedAns50 = {};
+        let totalAns50 = 0;
+
+        for (const range of colRanges50) {
+          const cropLeft  = Math.round(iW * range.leftFrac);
+          const cropWidth = Math.round(iW * range.widthFrac);
+
+          const colCrop = await sharp(buf)
+            .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
+            .resize(900, 1400, { fit: 'inside', withoutEnlargement: true })
+            .normalize()
+            .modulate({ brightness: 1.10, contrast: 1.30 })
+            .sharpen({ sigma: 1.8 })
+            .jpeg({ quality: 93 })
+            .toBuffer();
+
+          console.log(`[AutoChecker] 50Q per-col crop Q${range.from}-Q${range.to}: ${Math.round(colCrop.length/1024)}KB`);
+
+          const colRes = await scanWithGroq(
+            colCrop.toString('base64'), 'image/jpeg', 'bubble_omr',
+            range.to - range.from + 1,
+            range.from, range.to
+          );
+
+          if (colRes && colRes.answers) {
+            for (const [q, ans] of Object.entries(colRes.answers)) {
+              combinedAns50[q] = ans;
+            }
+            totalAns50 += colRes.answeredCount;
+          }
+        }
+
+        if (totalAns50 >= Math.ceil(questionCount * 0.50)) {
+          const ans50map = {};
+          for (let i = 1; i <= questionCount; i++) {
+            ans50map[String(i)] = combinedAns50[String(i)] ?? '';
+          }
+          groqResult = { studentName: null, answers: ans50map, answeredCount: totalAns50, engineConfidence: 80, confidence: 0.80 };
+          console.log(`[AutoChecker] 50Q per-column scan SUCCESS — ${totalAns50}/${questionCount} ✓`);
+        }
+      } catch (err5) {
+        console.warn('[AutoChecker] 50Q per-column attempt failed:', err5.message);
       }
     }
 
@@ -3784,7 +3869,7 @@ app.get('/health', (_req, res) => res.json({
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'groq-primary / jimp-fallback',
-  version: 'v10.2-groq-model-fix-col-recalibration-ballpen-threshold',
+  version: 'v10.3-suppress-cot-two-letter-hallucination-percol-50q',
 }));
 
 // ─── OMR Calibration endpoint — fine-tune layout constants per sheet ──────────
@@ -3833,7 +3918,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('[AutoChecker] OCR: Tesseract.js LSTM (OEM set at worker init) + ' + (sharp ? 'sharp preprocessing enabled' : 'NO sharp -- run: npm install sharp'));
   console.log('[AutoChecker] Groq vision: ' + (groqReady ? 'ready ✓' : GROQ_API_KEY ? 'key set, probe pending...' : 'not configured (add GROQ_API_KEY)'));
   console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
-  console.log('[AutoChecker] OMR improvements: v10.2 groq model fixed, col layout recalibrated, ballpen threshold raised');
+  console.log('[AutoChecker] OMR improvements: v10.3 cot suppressed, two-letter hallucination check, per-column 50Q');
 });
 
 // Keep-alive Sping â€” prevents Railway from sleeping
@@ -3842,4 +3927,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v102-groq-model-col-recal-fix
+// redeploy-trigger-20260526-v103-cot-suppress-hallucination-percol
