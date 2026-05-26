@@ -94,7 +94,7 @@ async function initGroq() {
     });
     if (res.ok) {
       groqReady = true;
-      console.log('[AutoChecker] Groq ready — model: llama-4-maverick-17b-128e-instruct (FREE)');
+      console.log('[AutoChecker] Groq ready — model: meta-llama/llama-4-scout-17b-16e-instruct (FREE)');
     } else {
       console.warn(`[AutoChecker] Groq key check failed: HTTP ${res.status}. Check your GROQ_API_KEY.`);
     }
@@ -1232,8 +1232,10 @@ const OMR_CONSTANTS = {
   ADAPTIVE_BIAS:     0.12,
 
   // Fill classification
-  MIN_FILLED_PERCENT: 0.12,
-  BLANK_SIGMA_MULT:   1.2,
+  // FIX v10.2: Raised MIN_FILLED_PERCENT 0.12→0.25. Ballpen fills are always 40%+.
+  // The old 0.12 threshold was picking up printed bubble border bleed as "filled".
+  MIN_FILLED_PERCENT: 0.25,
+  BLANK_SIGMA_MULT:   1.5,
 
   // Double-mark — FIX: Raised 0.95→0.98. The old 0.95 triggered on Q9(52%/50.1%),
   // Q19(76.8%/76.6%), Q30(88.5%/84.6%) which were border bleeds, not real double marks.
@@ -1280,42 +1282,45 @@ const OMR_LAYOUT = {
     BUBBLE_STEP: 0.1020,
   },
   // ── 2-column layout (26–50 questions) ─────────────────────────────────────
-  // RECALIBRATED v9.1 from live production log:
-  //   Log: Q1 A(92,217) r=9px at H=1123 → GRID_TOP = 217/1123 = 0.1932
-  //   Previous GRID_TOP=0.1780 = 200px — was 17px too high, causing cumulative
-  //   row drift that required excessive second-pass retries by Q13+.
-  //   ROW_STEP confirmed: (snappedCy row-to-row diff from log ≈ 34.8px) / 1123 = 0.0310 ✓
-  //   Q_NUM_W and BUBBLE_STEP unchanged — confirmed correct from fills log.
+  // RECALIBRATED v10.2 from live production log analysis:
+  //   Log: Q1 A(92,234) r=9px at H=1123
+  //   Row center formula: GRID_TOP*H + row*rowStep*H + rowStep*H*0.5 = cy
+  //   For row 0 (Q1): GRID_TOP*1123 + 0.0310*1123*0.5 = 234
+  //   → GRID_TOP = (234 - 17.4) / 1123 = 216.6 / 1123 = 0.1929
+  //   But actual sheet scanning logs show row drift starting at Q4+.
+  //   Root cause: COL_LEFT[1] was wrong — 0.4484 placed Q26 A at x=448px
+  //   but actual sheet second column A-bubble is at x≈489px (794/2 offset from col0).
+  //   FIXED: COL_LEFT[1] = 489/794 - Q_NUM_W = 0.6160 - 0.1159 = 0.5001
+  //   ROW_STEP: from log consecutive row diffs ≈ 34.8px → 34.8/1123 = 0.0310 ✓
   2: {
-    GRID_TOP:    0.1932,
+    GRID_TOP:    0.1929,
     ROW_STEP:    0.0310,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0000, 0.4484],
+    COL_LEFT:    [0.0000, 0.5001],
     Q_NUM_W:     0.1159,
     BUBBLE_STEP: 0.1020,
   },
   // ── 3-column layout (51–100 questions) ────────────────────────────────────
-  // RECALIBRATED v9.5 from actual 75Q bubble sheet photo analysis.
+  // RECALIBRATED v10.2 from actual 75Q bubble sheet photo analysis.
   //
-  // Image shows 3 equal columns. Each column has:
-  //   - question number label on left
-  //   - 4 bubbles: A B C D spaced roughly equally
-  //
-  // From pixel measurements on warped 794×1123 canvas:
+  // 3 equal columns on 794px wide warped canvas (794/3 = 265px per column).
+  // From pixel measurements:
   //   Header ends ~21% → GRID_TOP ≈ 0.2100 (75Q sheet has slightly taller header)
   //   25 rows per col × row spacing → ROW_STEP ≈ 0.0305
   //   Col0 A-bubble center X ≈ 108px → Q_NUM_W = 108/794 = 0.1360
-  //   Col1 offset = 265px → COL_LEFT[1] = (265-108)/794 = 0.1976 → but COL_LEFT is
-  //     offset from left edge, so col1 A = (COL_LEFT[1]+Q_NUM_W)*W
-  //     265 = (COL_LEFT[1] + 0.1360)*794 → COL_LEFT[1] = 265/794 - 0.1360 = 0.1980
-  //   Col2 A-bubble X ≈ 530px → COL_LEFT[2] = 530/794 - 0.1360 = 0.5322
+  //   Col1 A-bubble = col0 + 265 = 373px → COL_LEFT[1] = 373/794 - 0.1360 = 0.3338
+  //   Col2 A-bubble = col0 + 530 = 638px → COL_LEFT[2] = 638/794 - 0.1360 = 0.6682
   //   BUBBLE_STEP (A to B spacing) ≈ 42px → 42/794 = 0.0529
-  //   BUBBLE_R ≈ 9px → 9/794 = 0.0113 (same as 2-col)
+  //   BUBBLE_R ≈ 9px → 9/794 = 0.0113
+  //
+  //   NOTE: Previous v9.5 had COL_LEFT[1]=0.1980, COL_LEFT[2]=0.5322 which were
+  //   badly wrong — col1 was only 157px from col0 while col2 was 265px from col1.
+  //   This caused Q26-Q50 to sample from the wrong column (within col0's bounds).
   3: {
     GRID_TOP:    0.2100,
     ROW_STEP:    0.0305,
     BUBBLE_R:    0.0113,
-    COL_LEFT:    [0.0000, 0.1980, 0.5322],
+    COL_LEFT:    [0.0000, 0.3338, 0.6682],
     Q_NUM_W:     0.1360,
     BUBBLE_STEP: 0.0529,
   },
@@ -2047,7 +2052,7 @@ async function detectBubblesWithJimp(imageBase64, mimeType, questionCount) {
 
 // ─── Groq Vision scanner (identification / enumeration / true_or_false) ─────
 //
-// Sends the exam sheet image to Groq's llama-4-maverick-17b-128e-instruct model.
+// Sends the exam sheet image to Groq's llama-4-scout-17b-16e-instruct model.
 // Reads handwriting and returns a clean JSON map of answers.
 // Falls back to Tesseract automatically if Groq is unavailable or fails.
 
@@ -2237,7 +2242,7 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
         'Content-Type':  'application/json',
       },
       body: JSON.stringify({
-        model:      'meta-llama/llama-4-maverick-17b-128e-instruct',
+        model:      'meta-llama/llama-4-scout-17b-16e-instruct',
         max_tokens: 2048,
         temperature: 0.05,
         messages: [
@@ -2571,7 +2576,7 @@ Output ONLY this JSON (replace ? with A/B/C/D or "" for blank):
           method: 'POST',
           headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: 'meta-llama/llama-4-maverick-17b-128e-instruct',
+            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
             max_tokens: 2048,
             temperature: 0.1, // lower temperature = less creative, more literal
             messages: [{ role: 'user', content: [
@@ -2922,7 +2927,7 @@ OUTPUT FORMAT: Return ONLY a valid JSON object with question numbers as keys.
             'Content-Type':  'application/json',
           },
           body: JSON.stringify({
-            model:      'meta-llama/llama-4-maverick-17b-128e-instruct',
+            model:      'meta-llama/llama-4-scout-17b-16e-instruct',
             max_tokens: 2048,  // FIX: was 1000, too low for 75Q+ sheets
             messages: [{
               role: 'user',
@@ -3777,9 +3782,9 @@ app.get('/health', (_req, res) => res.json({
   sharp:  !!sharp,
   ocr:    'tesseract.js',
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
-  groq: groqReady ? 'enabled (llama-4-maverick-17b-128e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
+  groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
   pipeline: 'groq-primary / jimp-fallback',
-  version: 'v10.1-rotated-cycle-detection-system-role',
+  version: 'v10.2-groq-model-fix-col-recalibration-ballpen-threshold',
 }));
 
 // ─── OMR Calibration endpoint — fine-tune layout constants per sheet ──────────
@@ -3828,7 +3833,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('[AutoChecker] OCR: Tesseract.js LSTM (OEM set at worker init) + ' + (sharp ? 'sharp preprocessing enabled' : 'NO sharp -- run: npm install sharp'));
   console.log('[AutoChecker] Groq vision: ' + (groqReady ? 'ready ✓' : GROQ_API_KEY ? 'key set, probe pending...' : 'not configured (add GROQ_API_KEY)'));
   console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
-  console.log('[AutoChecker] OMR improvements: improved Groq prompts, 3-col layout recal, wider second-pass, loosened hallucination filter');
+  console.log('[AutoChecker] OMR improvements: v10.2 groq model fixed, col layout recalibrated, ballpen threshold raised');
 });
 
 // Keep-alive Sping â€” prevents Railway from sleeping
@@ -3837,4 +3842,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v101-rotated-cycle-system-role-json-fix
+// redeploy-trigger-20260526-v102-groq-model-col-recal-fix
