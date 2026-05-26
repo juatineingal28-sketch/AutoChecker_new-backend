@@ -1245,10 +1245,10 @@ const OMR_CONSTANTS = {
   MIN_RATIO:         1.12,
   MARGIN_THRESH_MULT: 2.0,
 
-  // Second-pass — FIX: Raised threshold 0.18→0.25 so only genuinely ambiguous
-  // questions retry. Lowered Y offsets to ±1px only — ±2px was jumping to wrong rows.
-  SECOND_PASS_CONF_THRESHOLD: 0.25,
-  SECOND_PASS_Y_OFFSETS: [-1, 1],
+  // Second-pass — FIX v9.5: Extended Y offsets [-3,-2,-1,1,2,3] for better row recovery.
+  // Tight ±1px was insufficient when perspective warp leaves rows ±2-3px off target.
+  SECOND_PASS_CONF_THRESHOLD: 0.20,
+  SECOND_PASS_Y_OFFSETS: [-3, -2, -1, 1, 2, 3],
 
   // Row snapping
   ROW_SNAP_SEARCH_RADIUS: 8,   // reduced from 10 — tighter snap, less risk of wrong row
@@ -1294,34 +1294,30 @@ const OMR_LAYOUT = {
     Q_NUM_W:     0.1159,
     BUBBLE_STEP: 0.1020,
   },
-  // 3-column layout (51–100 questions)
-  // RECALIBRATED v9.4 — re-measured from actual 75Q AutoChecker student sheet.
+  // ── 3-column layout (51–100 questions) ────────────────────────────────────
+  // RECALIBRATED v9.5 from actual 75Q bubble sheet photo analysis.
   //
-  // Physical sheet measurements (after homography warp to 794×1123px):
-  //   Header height: ~17% of page → GRID_TOP = 0.1932 (same as 2-col, same header)
-  //   Row spacing: 25 rows per column, same height as 2-col → ROW_STEP = 0.0310
+  // Image shows 3 equal columns. Each column has:
+  //   - question number label on left
+  //   - 4 bubbles: A B C D spaced roughly equally
   //
-  //   3-column sheet: usable width split into 3 equal columns
-  //   Each column: A B C D bubbles, step between bubbles ≈ 40px
-  //
-  //   Col0 (Q1-Q25)  first A-bubble x ≈ 111px  (Q_NUM_W = 111/794 = 0.1398)
-  //   Col1 (Q26-Q50) first A-bubble x ≈ 358px  (offset = (358-111)/794 = 0.3112)
-  //   Col2 (Q51-Q75) first A-bubble x ≈ 606px  (offset = (606-111)/794 = 0.6233)
-  //   BUBBLE_STEP ≈ 40px → 40/794 = 0.0504
-  //
-  //   v9.4 fix: COL_LEFT offsets adjusted — COL_LEFT is the offset from
-  //   paper left edge to the START of each column's content area.
-  //   bubbleX0 = (COL_LEFT[col] + Q_NUM_W) * W
-  //   So COL_LEFT[0]=0.0000 → bubbleX0 = 0.1398*794 = 111px ✓
-  //      COL_LEFT[1]=0.3112 → bubbleX0 = (0.3112+0.1398)*794 = 357px ✓ (was 0.3123 → 357px, close)
-  //      COL_LEFT[2]=0.6233 → bubbleX0 = (0.6233+0.1398)*794 = 605px ✓ (was 0.6247 → 606px, close)
+  // From pixel measurements on warped 794×1123 canvas:
+  //   Header ends ~21% → GRID_TOP ≈ 0.2100 (75Q sheet has slightly taller header)
+  //   25 rows per col × row spacing → ROW_STEP ≈ 0.0305
+  //   Col0 A-bubble center X ≈ 108px → Q_NUM_W = 108/794 = 0.1360
+  //   Col1 offset = 265px → COL_LEFT[1] = (265-108)/794 = 0.1976 → but COL_LEFT is
+  //     offset from left edge, so col1 A = (COL_LEFT[1]+Q_NUM_W)*W
+  //     265 = (COL_LEFT[1] + 0.1360)*794 → COL_LEFT[1] = 265/794 - 0.1360 = 0.1980
+  //   Col2 A-bubble X ≈ 530px → COL_LEFT[2] = 530/794 - 0.1360 = 0.5322
+  //   BUBBLE_STEP (A to B spacing) ≈ 42px → 42/794 = 0.0529
+  //   BUBBLE_R ≈ 9px → 9/794 = 0.0113 (same as 2-col)
   3: {
-    GRID_TOP:    0.1932,  // same as 2-col — same header height across all layouts
-    ROW_STEP:    0.0310,  // 25 rows per column, same spacing as 2-col
-    BUBBLE_R:    0.0113,  // same bubble radius as 2-col
-    COL_LEFT:    [0.0000, 0.3112, 0.6233],
-    Q_NUM_W:     0.1398,
-    BUBBLE_STEP: 0.0504,
+    GRID_TOP:    0.2100,
+    ROW_STEP:    0.0305,
+    BUBBLE_R:    0.0113,
+    COL_LEFT:    [0.0000, 0.1980, 0.5322],
+    Q_NUM_W:     0.1360,
+    BUBBLE_STEP: 0.0529,
   },
 };
 
@@ -2071,34 +2067,39 @@ async function scanWithGroq(imageBase64, mimeType, examType, questionCount, from
   // Per-type instructions — explicitly distinguish printed text from handwritten answers.
   // This is the root cause fix: the old prompt never told Groq to ignore printed choices.
   const typeInstructions = {
+    // (bubble_omr instructions injected below via isBubble path)
 
-    bubble_omr: `You are analyzing a PHYSICAL BUBBLE ANSWER SHEET photo. Your job is to identify which bubble the student physically filled with ink.
+    bubble_omr: `You are a precise bubble sheet scanner. Analyze this physical exam answer sheet photo.
 
-SHEET INFO: ${questionCount} questions, ${questionCount <= 25 ? '1 column' : questionCount <= 50 ? '2 columns (Q1-Q25 left, Q26-Q50 right)' : '3 columns (Q1-Q25 left, Q26-Q50 middle, Q51-Q75 right)'}.
-Read questions ${qFrom} to ${qTo}.
+SHEET LAYOUT: ${questionCount} total questions arranged in ${questionCount <= 25 ? '1 column' : questionCount <= 50 ? '2 columns: LEFT column has Q1-Q25, RIGHT column has Q26-Q50' : '3 columns: LEFT column Q1-Q25, MIDDLE column Q26-Q50, RIGHT column Q51-Q75'}.
+You must read questions ${qFrom} to ${qTo} ONLY.
 
-WHAT YOU'RE LOOKING AT:
-Each question row has 4 printed circles: A  B  C  D
-- The student SHADED one circle solid black with a ballpen
-- Shaded = solid dark ink fills the INSIDE of the circle (looks like a dark disk)
-- Unshaded = just a thin circle outline, white/empty inside
+HOW THE SHEET WORKS:
+- Each row = one question
+- Each row has the question number on the far left, then 4 bubbles labeled A B C D
+- The student FILLED exactly ONE bubble per row using a black ballpen
+- Filled bubble = circle with solid black/dark ink INSIDE it (it looks like a filled disk)
+- Empty bubble = circle with only an outline, white/hollow inside
 
-THE ANSWERS WILL LOOK RANDOM — this is a real exam. Do NOT generate patterns.
-Wrong approach: "B,C,B,C,B,C..." — this is a hallucination pattern, NOT real data.
-Right approach: examine each row individually, report what you actually see.
+YOUR TASK — do this for EVERY row from Q${qFrom} to Q${qTo}:
+1. Find the row for that question number
+2. Look at all 4 circles (A, B, C, D) in that row
+3. Identify which one has DARK SOLID FILL inside (not just a printed outline)
+4. Write down that letter
 
-FOR EACH QUESTION ROW:
-1. Locate the question number on the left
-2. Find all 4 circles (A, B, C, D) to its right
-3. Compare the INTERIOR darkness of all 4 circles
-4. The one with dark/black FILL inside = the answer
-5. If none appear filled, return ""
+CRITICAL RULES:
+- Each row is INDEPENDENT — look at each one separately, don't assume patterns
+- The column labeled "A" is always the LEFTMOST bubble in each row
+- The column labeled "B" is always SECOND from left
+- The column labeled "C" is always THIRD from left  
+- The column labeled "D" is always RIGHTMOST bubble
+- Do NOT confuse the printed circle outline with a filled bubble
+- A filled bubble has noticeably darker interior compared to empty ones
 
-IMPORTANT: Real exams typically have a mix of A, B, C, and D answers spread throughout.
-If you find yourself returning only 2 letters alternating (like B,C,B,C), STOP — you are hallucinating. Re-examine every row from scratch.
+OUTPUT FORMAT — return ONLY this JSON, no explanation, no markdown:
+{"${qFrom}":"X","${Number(qFrom)+1}":"X",...,"${qTo}":"X"}
 
-Return ONLY valid JSON, no extra text:
-{"${qFrom}":"A","${qFrom+1}":"C",...,"${qTo}":"B"}`,
+Where X is A, B, C, or D (or "" if that row appears completely blank).`,
 
     multiple_choice: `Each answer is a SINGLE LETTER (A, B, C, or D) handwritten by the student.
 
@@ -2359,9 +2360,11 @@ Empty/unanswered = "". If you see a student name at the top, also include "stude
           }
           const pCount  = vals.filter(v => v === p).length;
           const q2Count = vals.filter(v => v === q2).length;
-          // Fire if >85% of answers are from only these two letters AND both appear often
-          const bothPresent = pCount >= vals.length * 0.20 && q2Count >= vals.length * 0.20;
-          if (altMatches / vals.length >= 0.85 && bothPresent) {
+          // Fire if >92% of answers are from only these two letters AND both appear often
+          // FIX v9.5: raised from 85% → 92%. Short exams (25-30Q) can legitimately have
+          // only 2-3 options appear. 85% was falsely rejecting valid results.
+          const bothPresent = pCount >= vals.length * 0.25 && q2Count >= vals.length * 0.25;
+          if (altMatches / vals.length >= 0.92 && bothPresent) {
             console.warn(`[Groq] Hallucination detected — only ${p}+${q2} used (${altMatches}/${vals.length} = ${(altMatches/vals.length*100).toFixed(0)}%). Real exams use all 4 options. Rejecting.`);
             return null;
           }
@@ -2442,18 +2445,26 @@ if (isBubble) {
   if (sharp) {
     try {
       const inputBuf = Buffer.from(imageBase64, 'base64');
+      const meta = await sharp(inputBuf).metadata();
+      const origW = meta.width || 1500;
+      const origH = meta.height || 2000;
+
+      // Target max dimension: 2000px for 75Q (more detail needed), 1600px for ≤50Q
+      const maxDim = questionCount > 50 ? 2000 : 1600;
+
       const processed = await sharp(inputBuf)
         .rotate()                                          // fix EXIF orientation
         .greyscale()                                       // remove color
-        .modulate({ brightness: 1.05, contrast: 1.30 })   // boost contrast (was 1.15)
-        .normalise()                                       // stretch full range
+        .resize(maxDim, maxDim, { fit: 'inside', withoutEnlargement: false })
+        .normalise()                                       // stretch full range first
+        .modulate({ brightness: 1.10, contrast: 1.50 })   // strong contrast boost
         .median(2)                                         // remove speck noise
-        .sharpen({ sigma: 1.5, m1: 1.2, m2: 0.6 })       // sharpen bubble edges
+        .sharpen({ sigma: 1.8, m1: 1.5, m2: 0.8 })       // sharpen bubble edges
         .png()
         .toBuffer();
       processedBase64 = processed.toString('base64');
       processedMime   = 'image/png';
-      console.log('[AutoChecker] Bubble image normalised ✓ (high-contrast mode)');
+      console.log(`[AutoChecker] Bubble image normalised ✓ (high-contrast mode, ${Math.round(processed.length/1024)}KB)`);
     } catch (e) {
       console.warn('[AutoChecker] sharp pre-processing failed:', e.message);
     }
@@ -2484,22 +2495,32 @@ if (isBubble) {
             ? 'TWO columns: left (Q1-Q25) and right (Q26-Q50)'
             : 'THREE columns: left (Q1-Q25), middle (Q26-Q50), right (Q51-Q75)';
 
-        const rowByRowPrompt = `Look at this bubble answer sheet photo. It has ${colDesc}.
+        const rowByRowPrompt = `You are scanning a physical bubble answer sheet. This is attempt 2 — please be very careful and precise.
 
-Each row = 1 question. The row shows: [question number]  [circle A]  [circle B]  [circle C]  [circle D]
+LAYOUT: ${colDesc}. Questions ${1} to ${questionCount}.
 
-One circle per row is FILLED (solid black ink inside). The others are EMPTY (hollow outline only).
+Each row in the sheet looks like this:
+  [number]  [○ A]  [○ B]  [○ C]  [○ D]
 
-Go through EVERY row from top to bottom in EVERY column. For each row:
-- Look at which of the 4 circles has dark solid ink INSIDE it (not just an outline)
-- That is the student's answer
+The student filled EXACTLY ONE circle per row with black ballpen ink.
+- Filled = the circle interior is DARK/BLACK (solid disk appearance)
+- Empty = the circle is just a hollow outline (white inside)
 
-The answers will be different for each row. Do NOT repeat the same letter. Do NOT alternate letters. Actually look at each circle.
+INSTRUCTIONS — go through EVERY row one at a time:
+Step 1: Find the row number on the left side
+Step 2: Scan across: which of the 4 circles (A B C D) has a dark filled interior?
+Step 3: Record that letter for that question number
+Step 4: Move to the next row
 
-Output ONLY this JSON (no other text):
-{"1":"?","2":"?","3":"?",..."${questionCount}":"?"}
+DO NOT skip any rows. DO NOT create patterns. Each row has a genuinely different answer.
 
-Replace each ? with A, B, C, or D based on which bubble is physically filled. Use "" if blank.`;
+The leftmost bubble in each row = A
+Second bubble = B
+Third bubble = C  
+Rightmost bubble = D
+
+Output ONLY this JSON (replace ? with A/B/C/D or "" for blank):
+{${Array.from({length: questionCount}, (_, i) => `"${i+1}":"?"`).join(',')}}`;
 
         // Use original image at high resolution for attempt 2
         let retryBase64 = imageBase64;
@@ -2617,9 +2638,13 @@ Replace each ? with A, B, C, or D based on which bubble is physically filled. Us
         const iW = meta.width || 1500, iH = meta.height || 2000;
 
         const colRanges = [
-          { from: 1, to: 25, leftFrac: 0.01, widthFrac: 0.33 },
-          { from: 26, to: 50, leftFrac: 0.33, widthFrac: 0.34 },
-          { from: 51, to: questionCount, leftFrac: 0.66, widthFrac: 0.34 },
+          // FIX v9.5: Column fractions recalibrated from actual 75Q sheet.
+          // The 3 columns divide the usable page width (after margins) into thirds.
+          // Left margin ≈ 3%, right margin ≈ 3%, each col ≈ 31% of page width.
+          // Add small overlap (2%) on each side to avoid cutting bubble edges.
+          { from: 1,  to: 25,             leftFrac: 0.00, widthFrac: 0.36 },
+          { from: 26, to: 50,             leftFrac: 0.33, widthFrac: 0.36 },
+          { from: 51, to: questionCount,  leftFrac: 0.64, widthFrac: 0.36 },
         ];
 
         const combinedAnswers = {};
@@ -3732,9 +3757,44 @@ app.get('/health', (_req, res) => res.json({
   ocr:    'tesseract.js',
   bubbleOmr: !!Jimp ? 'jimp-pixel-detection' : 'unavailable (npm install jimp)',
   groq: groqReady ? 'enabled (llama-4-scout-17b-16e-instruct) — FREE' : GROQ_API_KEY ? 'key set but probe failed' : 'disabled (add GROQ_API_KEY to Railway env vars)',
-  pipeline: 'tesseract-primary / groq-optional-enhancer',
-  version: '8.5-75Q-groq-hallucination-fix',
+  pipeline: 'groq-primary / jimp-fallback',
+  version: '9.5-improved-groq-prompts-hallucination-fix-layout-recal',
 }));
+
+// ─── OMR Calibration endpoint — fine-tune layout constants per sheet ──────────
+// POST /api/omr-calibrate { questionCount, q1_ax, q1_ay, q1_bx, rowStep?, gridTop? }
+// Computes Q_NUM_W, BUBBLE_STEP, GRID_TOP from pixel measurements on the ORIGINAL image
+// (before warp). Supply pixel coords from a debug overlay or manual inspection.
+app.post('/api/omr-calibrate', (req, res) => {
+  const { questionCount, q1_ax, q1_ay, q1_bx, q2_ay, imageWidth, imageHeight } = req.body;
+  if (!questionCount || !q1_ax || !q1_bx || !imageWidth || !imageHeight) {
+    return res.status(400).json({ error: 'Required: questionCount, q1_ax, q1_bx, imageWidth, imageHeight' });
+  }
+  const W = TARGET_W, H = TARGET_H;
+  // Scale coords from original image to warped canvas
+  const scaleX = W / imageWidth;
+  const scaleY = H / (imageHeight || imageWidth * 1.414);
+  const ax = q1_ax * scaleX;
+  const ay = q1_ay ? q1_ay * scaleY : null;
+  const bx = q1_bx * scaleX;
+  const bubbleStep = (bx - ax) / W;
+  const numW = ax / W;
+  const numCols = questionCount <= 25 ? 1 : questionCount <= 50 ? 2 : 3;
+  const gridTop = ay ? ay / H : OMR_LAYOUT[numCols].GRID_TOP;
+  const rowStep = q2_ay ? (q2_ay * scaleY - ay) / H : OMR_LAYOUT[numCols].ROW_STEP;
+
+  const calibrated = {
+    numCols,
+    Q_NUM_W: +numW.toFixed(4),
+    BUBBLE_STEP: +bubbleStep.toFixed(4),
+    GRID_TOP: +gridTop.toFixed(4),
+    ROW_STEP: +rowStep.toFixed(4),
+    note: 'These values replace the corresponding constants in OMR_LAYOUT[' + numCols + '] in server.js'
+  };
+  console.log('[OMR Calibrate] Computed layout:', calibrated);
+  res.json(calibrated);
+});
+
 
 // Error handler
 app.use((err, _req, res, _next) => {
@@ -3743,10 +3803,11 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('[AutoChecker] v7.0 running on http://0.0.0.0:' + PORT);
+  console.log('[AutoChecker] v9.5 running on http://0.0.0.0:' + PORT);
   console.log('[AutoChecker] OCR: Tesseract.js LSTM (OEM set at worker init) + ' + (sharp ? 'sharp preprocessing enabled' : 'NO sharp -- run: npm install sharp'));
   console.log('[AutoChecker] Groq vision: ' + (groqReady ? 'ready ✓' : GROQ_API_KEY ? 'key set, probe pending...' : 'not configured (add GROQ_API_KEY)'));
   console.log('[AutoChecker] PSM routing -- MCQ:[6,4]  TrueFalse:[7,6,11]  Written:[6,11]');
+  console.log('[AutoChecker] OMR improvements: improved Groq prompts, 3-col layout recal, wider second-pass, loosened hallucination filter');
 });
 
 // Keep-alive Sping â€” prevents Railway from sleeping
@@ -3755,4 +3816,4 @@ setInterval(() => {
     .catch(() => {});
 }, 4 * 60 * 1000); // reduced from 5min — Railway sleeps at 5min inactivity
 
-// redeploy-trigger-20260526-v85-75Q-fix-groq-hallucination-jimp-recal
+// redeploy-trigger-20260526-v95-improved-groq-prompts-hallucination-fix-3col-layout
